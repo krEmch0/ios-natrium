@@ -92,15 +92,14 @@ jobs:
           cd xnu/src
           export SDKROOT=$(xcrun --show-sdk-path)
           mkdir -p "$SDKROOT/usr/local/libexec"
-          # availability.pl must print version lists when called with --ios or --macosx
-          python3 -c "
-import sys
-args = sys.argv[1:]
-if '--ios' in args:
-    print('8.0 9.0 10.0 11.0 12.0 13.0 14.0 15.0 16.0')
-elif '--macosx' in args:
-    print('10.9 10.10 10.11 10.12 10.13 10.14 10.15 11.0 12.0 13.0')
-" > /tmp/avail_stub.py
+          cat > /tmp/avail_stub.py << 'AVAIL_EOF'
+          import sys
+          args = sys.argv[1:]
+          if '--ios' in args:
+              print('8.0 9.0 10.0 11.0 12.0 13.0 14.0 15.0 16.0')
+          elif '--macosx' in args:
+              print('10.9 10.10 10.11 10.12 10.13 10.14 10.15 11.0 12.0 13.0')
+          AVAIL_EOF
           printf '#!/bin/sh\nexec python3 /tmp/avail_stub.py "$@"\n' > "$SDKROOT/usr/local/libexec/availability.pl"
           chmod +x "$SDKROOT/usr/local/libexec/availability.pl"
           sed -i '' '/^SUPPORTED_ARM64_MACHINE_CONFIGS.*BCM2837/s/.*/SUPPORTED_ARM64_MACHINE_CONFIGS = SWEET/' makedefs/MakeInc.def
