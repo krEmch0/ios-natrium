@@ -108,8 +108,9 @@ jobs:
           sed -i '' 's/^SUPPORTED_ARM64_MACHINE_CONFIGS = .*/SUPPORTED_ARM64_MACHINE_CONFIGS = SWEET/' makedefs/MakeInc.def
           sed -i '' 's/^\(override DEFAULT_ARM64_MACHINE_CONFIG[[:space:]]*:= \).*/\1SWEET/' makedefs/MakeInc.top
           grep -E "SUPPORTED_ARM64_MACHINE_CONFIGS|DEFAULT_ARM64_MACHINE_CONFIG" makedefs/MakeInc.def makedefs/MakeInc.top
-          ls -la "$SDKROOT/usr/local/lib/" || echo "No lib dir"
-          find /tmp/xnu-dst -name "*.a" -o -name "externs.o" || echo "No archives found"
+          echo "=== Checking SETUP/config ==="
+          ls -la SETUP/config/
+          echo "=== Starting XNU build ==="
           make -e \
             MACHINE_CONFIG=SWEET \
             ARCH_CONFIGS=ARM64 \
