@@ -90,7 +90,7 @@ jobs:
           printf '#!/usr/bin/env perl\nprint "// Auto-generated stub\\n";\n' > "$SDKROOT/usr/local/libexec/availability.pl"
           chmod +x "$SDKROOT/usr/local/libexec/availability.pl"
           # Restrict supported configs to SWEET only so VMAPPLE is never attempted
-          sed -i '' 's/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET/SUPPORTED_ARM64_MACHINE_CONFIGS = SWEET/' makedefs/MakeInc.def
+          sed -i '' 's/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837.*/SUPPORTED_ARM64_MACHINE_CONFIGS = SWEET/' makedefs/MakeInc.def
           grep SUPPORTED_ARM64_MACHINE_CONFIGS makedefs/MakeInc.def
           make \
             MACHINE_CONFIG=SWEET \
