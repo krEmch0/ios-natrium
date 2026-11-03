@@ -83,6 +83,14 @@ jobs:
         run: |
           cd xnu/src
           export SDKROOT=$(xcrun --show-sdk-path)
+          # Create stub availability.pl to work around missing Apple internal tool
+          mkdir -p "$SDKROOT/usr/local/libexec"
+          cat > "$SDKROOT/usr/local/libexec/availability.pl" << 'EOF'
+          #!/usr/bin/env perl
+          # Stub for availability.pl - generates empty symbol aliasing header
+          print "// Auto-generated stub by natrium build\n";
+          EOF
+          chmod +x "$SDKROOT/usr/local/libexec/availability.pl"
           make \
             MACHINE_CONFIG=NATRIUM \
             ARCH_CONFIGS=ARM64 \
