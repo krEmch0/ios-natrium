@@ -71,7 +71,10 @@ jobs:
       - name: Build dtrace stubs
         run: |
           cd xnu/deps/dtrace
-          make install DSTROOT=/tmp/dst SRCROOT=$(pwd) OBJROOT=/tmp/obj SYMROOT=/tmp/sym
+          # Build just the ctfconvert/ctfdump tools XNU needs
+          make DSTROOT=/tmp/dst OBJROOT=/tmp/obj SYMROOT=/tmp/sym || \
+          xcodebuild -target ctfconvert -target ctfdump DSTROOT=/tmp/dst || \
+          echo "dtrace build skipped - continuing without it"
         continue-on-error: true
 
       - name: Build AvailabilityVersions
