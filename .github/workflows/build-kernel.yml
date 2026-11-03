@@ -120,18 +120,7 @@ jobs:
           echo "=== Fixing missing/broken headers ==="
           # Fix 1: Create asm.h stub and move it from EXPORT_MD_GEN_LIST to EXPORT_MD_LIST
           printf '/* stub asm.h for open-source build */\n#ifndef _MACH_ARM_ASM_H_\n#define _MACH_ARM_ASM_H_\n#endif\n' > osfmk/mach/arm/asm.h
-          cat > /tmp/fix_asm.py << 'PYEOF'
-with open('osfmk/mach/arm/Makefile') as f:
-    t = f.read()
-t = t.replace('EXPORT_MD_LIST = ${DATAFILES}', 'EXPORT_MD_LIST = ${DATAFILES} asm.h')
-t = t.replace('EXPORT_MD_GEN_LIST = \\\n        asm.h', 'EXPORT_MD_GEN_LIST =')
-t = t.replace('INSTALL_MD_LIST = ${DATAFILES}', 'INSTALL_MD_LIST = ${DATAFILES} asm.h')
-t = t.replace('INSTALL_MD_GEN_LIST = \\\n        asm.h', 'INSTALL_MD_GEN_LIST =')
-t = t.replace('INSTALL_SF_MD_LCL_GEN_LIST = \\\n        asm.h', 'INSTALL_SF_MD_LCL_GEN_LIST =')
-with open('osfmk/mach/arm/Makefile', 'w') as f:
-    f.write(t)
-print('arm/Makefile: asm.h moved from GEN to DATA list')
-PYEOF
+          printf "with open('osfmk/mach/arm/Makefile') as f:\n    t = f.read()\nt = t.replace('EXPORT_MD_LIST = \${DATAFILES}', 'EXPORT_MD_LIST = \${DATAFILES} asm.h')\nt = t.replace('EXPORT_MD_GEN_LIST = \\\\\\\\\\\\n        asm.h', 'EXPORT_MD_GEN_LIST =')\nt = t.replace('INSTALL_MD_LIST = \${DATAFILES}', 'INSTALL_MD_LIST = \${DATAFILES} asm.h')\nt = t.replace('INSTALL_MD_GEN_LIST = \\\\\\\\\\\\n        asm.h', 'INSTALL_MD_GEN_LIST =')\nt = t.replace('INSTALL_SF_MD_LCL_GEN_LIST = \\\\\\\\\\\\n        asm.h', 'INSTALL_SF_MD_LCL_GEN_LIST =')\nwith open('osfmk/mach/arm/Makefile', 'w') as f:\n    f.write(t)\nprint('arm/Makefile: asm.h moved from GEN to DATA list')\n" > /tmp/fix_asm.py
           python3 /tmp/fix_asm.py
           # Fix 2: Add VPATH to osfmk/mach/Makefile so MIG finds .defs source files
           printf 'VPATH = $(SOURCE)\n' | cat - osfmk/mach/Makefile > /tmp/mach_mf && mv /tmp/mach_mf osfmk/mach/Makefile
