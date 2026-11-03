@@ -1,0 +1,452 @@
+--- a/bsd/dev/natrium_wlan.c
++++ b/bsd/dev/natrium_wlan.c
+@@ -28,6 +28,19 @@
+ #include <libkern/crypto/sha1.h>
+ #include <libkern/crypto/aes.h>
+ #include <sys/random.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/route.h>
++#include <kern/locks.h>
++#include <netinet/in.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+@@ -1436,9 +1449,42 @@
+ static uint32_t wl_htt_alloc, wl_htt_rd, wl_htt_rx;    /* HTT rx ring: host write and read index, MSDUs indicated */
+ static uint32_t wl_htt_types;                   /* HTT T2H message types seen (logged once each) */
+ static int32_t wl_txc_id = -1;                  /* last HTT tx completion: msdu id, status */
++static uint16_t wl_txc_n;                       /* tx completions so far (data and management) */
+ static uint32_t wl_txc_status;
+ static uint8_t wl_eapol[512], wl_ip[1600];     /* last EAPOL-Key frame and IPv4 packet received */
+ static uint32_t wl_eapol_len, wl_ip_len;
++static ifnet_t wl_ifp;                          /* en0 once DHCP is done: data frames go to the stack */
++
++/* Native-wifi data frame (header, LLC/SNAP at o) -> Ethernet frame into en0. */
++static void
++wl_if_input(const volatile uint8_t *p, uint32_t len, uint32_t o)
++{
++	mbuf_t m = NULL;
++	uint32_t n = len - o - 8;
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < ETHER_HDR_LEN + n) {
++		if (m) {
++			mbuf_freem(m);
++		}
++		ifnet_stat_increment_in(wl_ifp, 0, 0, 1);
++		return;
++	}
++	uint8_t *e = mbuf_data(m);
++	bool fromds = p[1] & 2;
++	memcpy(e, (const void *)(p + 4), 6);                    /* DA = A1 */
++	memcpy(e + 6, (const void *)(p + (fromds ? 16 : 10)), 6);      /* SA = A3 from the AP, else A2 */
++	e[12] = p[o + 6];
++	e[13] = p[o + 7];
++	memcpy(e + ETHER_HDR_LEN, (const void *)(p + o + 8), n);
++	struct ifnet_stat_increment_param st = { .packets_in = 1, .bytes_in = ETHER_HDR_LEN + n };
++	mbuf_setlen(m, ETHER_HDR_LEN + n);
++	mbuf_pkthdr_setlen(m, ETHER_HDR_LEN + n);
++	mbuf_pkthdr_setrcvif(m, wl_ifp);
++	mbuf_pkthdr_setheader(m, e);
++	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++	(void)mbuf_setdata(m, e + ETHER_HDR_LEN, n);
++	ifnet_input(wl_ifp, m, &st);
++}
+ 
+ /*
+  * One received MSDU (native-wifi decap: 802.11 header without QoS, then
+@@ -1456,6 +1502,10 @@
+ 			continue;
+ 		}
+ 		uint16_t type = (uint16_t)(p[o + 6] << 8 | p[o + 7]);
++		if (wl_ifp && type != 0x888e && (p[0] & 0x0c) == 0x08) {
++			wl_if_input(p, len, o);
++			return;
++		}
+ 		uint8_t *dst = type == 0x888e ? wl_eapol : type == 0x0800 ? wl_ip : NULL;
+ 		uint32_t n = len - o - 8, max = type == 0x888e ? sizeof(wl_eapol) : sizeof(wl_ip);
+ 		if (dst && n <= max) {
+@@ -1579,6 +1629,9 @@
+ 					}
+ 				}
+ 				*(volatile uint32_t *)(wl_dma + D_HTT_IDX) = wl_htt_alloc;
++			}
++			if (eid == wl_htt_ep && len - tl >= 1 && f[8] == 14) {     /* MGMT_TX_COMPLETION */
++				wl_txc_n++;
+ 			}
+ 			if (eid == wl_htt_ep && len - tl >= 8 && f[8] == 18) {
+ 				/*
+@@ -1614,6 +1667,7 @@
+ 			if (eid == wl_htt_ep && len - tl >= 6 && f[8] == 7) {  /* TX_COMPL_IND: status, count, ids */
+ 				uint32_t nm = f[10];
+ 				wl_txc_status = f[9] & 7u;
++				wl_txc_n = (uint16_t)(wl_txc_n + nm);
+ 				if (nm && 12 + 2 * nm <= 8 + len) {
+ 					wl_txc_id = f[10 + 2 * nm] | f[11 + 2 * nm] << 8;     /* the last one */
+ 				}
+@@ -2093,8 +2147,9 @@
+ #define TAG_PEER_ASSOC                  0x65u
+ #define TAG_VHT_RATE_SET                0x66u
+ #define TAG_STA_PS_MODE                 0x6cu
+-#define D_TXFRAG                        0x21800u        /* HTT tx fragment list: {paddr, len}, {0, 0} */
+-#define D_TXF                           0x22000u        /* HTT tx frame, 2 KB */
++#define D_TXFRAG                        0x21800u        /* HTT tx fragment lists, 16 bytes per slot: {paddr, len}, {0, 0} */
++#define D_TXF                           0x22000u        /* HTT tx frames, 2 KB per slot */
++#define WL_TXSLOTS                      32u             /* slot = msdu id % 32; the firmware holds at most 31 */
+ 
+ /* EAPOL-Key frame offsets, 802.1X header included. */
+ #define EK_INFO         5
+@@ -2308,12 +2363,21 @@
+ static bool
+ wl_htt_tx(const uint8_t *fr, uint32_t len, bool mgmt)
+ {
+-	uint8_t *f = (uint8_t *)(wl_dma + D_TXF), *p = wl_htc_tx_payload(&ce4);
+-	volatile uint32_t *frag = (volatile uint32_t *)(wl_dma + D_TXFRAG);
+-	uint32_t pre = ((len < 50 ? len : 50) + 3) & ~3u, pa = WL_DMA_PA + (mgmt ? D_TXF : D_TXFRAG);
++	/* A free slot: wait for completions while 31 frames are out (a lost completion times out). */
++	for (uint64_t end = wl_ms() + 50; (uint16_t)(wl_tx_id - wl_txc_n) >= WL_TXSLOTS - 1;) {
++		if (wl_ms() >= end) {
++			wl_txc_n = wl_tx_id;
++			break;
++		}
++		(void)wl_htc_poll(1);
++	}
+ 	uint16_t flags1 = (uint16_t)((mgmt ? 17u : 16u) << 6 | 1u << 11), id = ++wl_tx_id;
++	uint32_t slot = id % WL_TXSLOTS, fo = D_TXF + 2048 * slot, lo = D_TXFRAG + 16 * slot;
++	uint8_t *f = (uint8_t *)(wl_dma + fo), *p = wl_htc_tx_payload(&ce4);
++	volatile uint32_t *frag = (volatile uint32_t *)(wl_dma + lo);
++	uint32_t pre = ((len < 50 ? len : 50) + 3) & ~3u, pa = WL_DMA_PA + (mgmt ? fo : lo);
+ 	memcpy(f, fr, len);
+-	frag[0] = WL_DMA_PA + D_TXF;
++	frag[0] = WL_DMA_PA + fo;
+ 	frag[1] = len;
+ 	frag[2] = frag[3] = 0;
+ 	p[0] = 1;                                       /* TX_FRM */
+@@ -2530,14 +2594,19 @@
+ 	return done;
+ }
+ 
+-/* DHCP DISCOVER (broadcast) and wait for an OFFER: proves encrypted tx and rx. */
++/*
++ * DHCP (RFC 2131) from the kernel: DISCOVER -> OFFER -> REQUEST -> ACK.
++ * The lease (address, mask, router, DNS) configures en0.
++ */
++static uint8_t wl_lease_ip[4], wl_lease_mask[4], wl_lease_gw[4], wl_lease_dns[4], wl_lease_srv[4];
++static uint32_t wl_lease_secs;
++
+ static bool
+-wl_dhcp(void)
++wl_dhcp_send(const uint8_t xid[4], uint8_t type)
+ {
+ 	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+ 	static uint8_t ip[328];
+-	uint8_t *u = ip + 20, *d = u + 8, xid[4];
+-	read_random(xid, 4);
++	uint8_t *u = ip + 20, *d = u + 8, *o = d + 240;
+ 	bzero(ip, sizeof(ip));
+ 	ip[0] = 0x45;
+ 	ip[2] = sizeof(ip) >> 8;
+@@ -2563,35 +2632,262 @@
+ 	memcpy(d + 4, xid, 4);
+ 	d[10] = 0x80;                                   /* broadcast reply */
+ 	memcpy(d + 28, wl_mac, 6);
+-	static const uint8_t opt[] = { 0x63, 0x82, 0x53, 0x63, 53, 1, 1, 55, 3, 1, 3, 6, 255 };
+-	memcpy(d + 236, opt, sizeof(opt));
+-	for (int tries = 0; tries < 3; tries++) {
+-		wl_ip_len = 0;
+-		if (!wl_data_tx(bcast, 0x0800, ip, sizeof(ip))) {
+-			return false;
++	static const uint8_t magic[4] = { 0x63, 0x82, 0x53, 0x63 };
++	memcpy(d + 236, magic, 4);
++	*o++ = 53;
++	*o++ = 1;
++	*o++ = type;
++	if (type == 3) {                                /* REQUEST: the offered address from that server */
++		*o++ = 50;
++		*o++ = 4;
++		memcpy(o, wl_lease_ip, 4);
++		o += 4;
++		*o++ = 54;
++		*o++ = 4;
++		memcpy(o, wl_lease_srv, 4);
++		o += 4;
++	}
++	static const uint8_t prl[] = { 55, 4, 1, 3, 6, 51, 12, 7, 's', 'a', 'i', 'l', 'f', 'i', 's', 'h', 255 };
++	memcpy(o, prl, sizeof(prl));
++	return wl_data_tx(bcast, 0x0800, ip, sizeof(ip));
++}
++
++/* Wait for a reply of DHCP type want (2 OFFER, 5 ACK) to xid; fills the lease. Returns its type, 0 on timeout. */
++static uint8_t
++wl_dhcp_wait(const uint8_t xid[4], uint8_t want, uint32_t ms)
++{
++	for (uint64_t end = wl_ms() + ms; wl_ms() < end;) {
++		(void)wl_htc_poll(10);
++		if (wl_ip_len < 28 + 240 || wl_ip[9] != 17) {
++			continue;
+ 		}
+-		bool txok = wl_tx_wait(500);
+-		printf("NATRIUM WLAN: DHCP DISCOVER sent (tx %s, status %u)\n", txok ? "done" : "no completion", wl_txc_status);
+-		for (uint64_t end = wl_ms() + 3000; wl_ms() < end;) {
+-			(void)wl_htc_poll(10);
+-			if (wl_ip_len < 28 + 240 || wl_ip[9] != 17) {
++		uint32_t n = wl_ip_len, ihl = (wl_ip[0] & 15u) * 4;
++		const uint8_t *ru = wl_ip + ihl, *rd = ru + 8;
++		wl_ip_len = 0;
++		if (ihl + 8 + 240 > n || ru[3] != 68 || rd[0] != 2 || memcmp(rd + 4, xid, 4) != 0) {
++			continue;
++		}
++		uint8_t type = 0;
++		for (uint32_t i = ihl + 8 + 240; i + 2 <= n && wl_ip[i] != 255; i += wl_ip[i] ? 2u + wl_ip[i + 1] : 1u) {
++			const uint8_t *v = &wl_ip[i + 2];
++			uint8_t c = wl_ip[i], l = wl_ip[i + 1];
++			if (c == 0 || i + 2 + l > n) {
+ 				continue;
+ 			}
+-			const uint8_t *ru = wl_ip + (wl_ip[0] & 15) * 4, *rd = ru + 8;
+-			wl_ip_len = 0;
+-			if (ru[3] != 68 || rd[0] != 2 || memcmp(rd + 4, xid, 4) != 0) {
+-				continue;
++			if (c == 53 && l >= 1) {
++				type = v[0];
++			} else if (c == 1 && l >= 4) {
++				memcpy(wl_lease_mask, v, 4);
++			} else if (c == 3 && l >= 4) {
++				memcpy(wl_lease_gw, v, 4);
++			} else if (c == 6 && l >= 4) {
++				memcpy(wl_lease_dns, v, 4);
++			} else if (c == 54 && l >= 4) {
++				memcpy(wl_lease_srv, v, 4);
++			} else if (c == 51 && l >= 4) {
++				wl_lease_secs = (uint32_t)v[0] << 24 | (uint32_t)v[1] << 16 | (uint32_t)v[2] << 8 | v[3];
+ 			}
+-			printf("NATRIUM WLAN: DHCP OFFER: %u.%u.%u.%u from %u.%u.%u.%u\n", rd[16], rd[17], rd[18], rd[19],
+-			    wl_ip[12], wl_ip[13], wl_ip[14], wl_ip[15]);
+-			return true;
+ 		}
++		if (type == want || type == 6) {        /* 6: NAK */
++			memcpy(wl_lease_ip, rd + 16, 4);
++			return type;
++		}
+ 	}
+-	printf("NATRIUM WLAN: no DHCP OFFER (%u MSDUs received)\n", wl_htt_rx);
+-	return false;
++	return 0;
++}
++
++static bool
++wl_dhcp(void)
++{
++	uint8_t xid[4], got = 0;
++	read_random(xid, 4);
++	for (int tries = 0; tries < 4 && got != 2; tries++) {
++		got = wl_dhcp_send(xid, 1) ? wl_dhcp_wait(xid, 2, 3000) : 0;
++	}
++	if (got != 2) {
++		printf("NATRIUM WLAN: DHCP: no OFFER (%u MSDUs received)\n", wl_htt_rx);
++		return false;
++	}
++	for (int tries = 0; tries < 4 && got != 5 && got != 6; tries++) {
++		got = wl_dhcp_send(xid, 3) ? wl_dhcp_wait(xid, 5, 3000) : 0;
++	}
++	printf("NATRIUM WLAN: DHCP %s: %u.%u.%u.%u/%u.%u.%u.%u router %u.%u.%u.%u dns %u.%u.%u.%u lease %u s\n",
++	    got == 5 ? "ACK" : got == 6 ? "NAK" : "no ACK", wl_lease_ip[0], wl_lease_ip[1], wl_lease_ip[2], wl_lease_ip[3],
++	    wl_lease_mask[0], wl_lease_mask[1], wl_lease_mask[2], wl_lease_mask[3], wl_lease_gw[0], wl_lease_gw[1], wl_lease_gw[2],
++	    wl_lease_gw[3], wl_lease_dns[0], wl_lease_dns[1], wl_lease_dns[2], wl_lease_dns[3], wl_lease_secs);
++	return got == 5;
+ }
+ 
++/*
++ * en0: an Ethernet interface for the stack (as ue0 in sweet_usb.c). Output
++ * only queues; the Wi-Fi thread converts and sends (wl_run).
++ */
++#define WL_IFQ 64u
++static lck_mtx_t *wl_ifq_lock;
++static mbuf_t wl_ifq[WL_IFQ];
++static uint32_t wl_ifq_head, wl_ifq_count;
++
++static errno_t
++wl_if_output(ifnet_t ifp, mbuf_t m)
++{
++	lck_mtx_lock(wl_ifq_lock);
++	if (wl_ifq_count == WL_IFQ) {
++		lck_mtx_unlock(wl_ifq_lock);
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	wl_ifq[(wl_ifq_head + wl_ifq_count++) % WL_IFQ] = m;
++	lck_mtx_unlock(wl_ifq_lock);
++	ifnet_stat_increment_out(ifp, 1, mbuf_pkthdr_len(m), 0);
++	return 0;
++}
++
++static errno_t
++wl_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
++{
++	switch (cmd) {
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++wl_if_detach(ifnet_t ifp __unused)
++{
++}
++
++static void
++wl_sin(struct sockaddr_in *a, const uint8_t ip[4])
++{
++	bzero(a, sizeof(*a));
++	a->sin_len = sizeof(*a);
++	a->sin_family = AF_INET;
++	memcpy(&a->sin_addr, ip, 4);
++}
++
+ static bool
++wl_if_create(void)
++{
++	struct ifnet_init_eparams init;
++	ifnet_t ifp = NULL;
++	wl_ifq_lock = lck_mtx_alloc_init(lck_grp_alloc_init("natrium_wlan", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "natrium-wlan";
++	init.uniqueid_len = sizeof("natrium-wlan") - 1;
++	init.name = "en";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = wl_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = wl_if_ioctl;
++	init.detach = wl_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &ifp) != 0) {
++		printf("NATRIUM WLAN: en0: ifnet_allocate failed\n");
++		return false;
++	}
++	ifnet_set_addrlen(ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(ifp, ETHERMTU);
++	ifnet_set_baudrate(ifp, 54000000);
++	ifnet_set_flags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(ifp, NULL) != 0) {
++		printf("NATRIUM WLAN: en0: ifnet_attach failed\n");
++		return false;
++	}
++	ifnet_set_lladdr(ifp, wl_mac, ETHER_ADDR_LEN);
++	wl_ifp = ifp;
++
++	errno_t err = proto_plumb(PF_INET, ifp);
++	socket_t so = NULL;
++	if (err == 0) {
++		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	}
++	if (err == 0) {
++		struct ifaliasreq ifra;
++		uint8_t bc[4];
++		for (int i = 0; i < 4; i++) {
++			bc[i] = (uint8_t)(wl_lease_ip[i] | ~wl_lease_mask[i]);
++		}
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "en0");
++		wl_sin((struct sockaddr_in *)&ifra.ifra_addr, wl_lease_ip);
++		wl_sin((struct sockaddr_in *)&ifra.ifra_mask, wl_lease_mask);
++		wl_sin((struct sockaddr_in *)&ifra.ifra_broadaddr, bc);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	ifnet_set_flags(ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	int rerr = -1;
++	if (err == 0 && wl_lease_gw[0]) {                /* default route via the router */
++		static const uint8_t zero[4];
++		struct sockaddr_in dst, gw, mask;
++		wl_sin(&dst, zero);
++		wl_sin(&gw, wl_lease_gw);
++		wl_sin(&mask, zero);
++		rerr = rtrequest(RTM_ADD, (struct sockaddr *)&dst, (struct sockaddr *)&gw, (struct sockaddr *)&mask,
++		    RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
++	}
++	printf("NATRIUM WLAN: en0 %s: %u.%u.%u.%u (err %d), default route %s (err %d)\n", err ? "NOT configured" : "up",
++	    wl_lease_ip[0], wl_lease_ip[1], wl_lease_ip[2], wl_lease_ip[3], err, rerr == 0 ? "set" : "NOT set", rerr);
++	return err == 0;
++}
++
++/*
++ * The data path, polled (ponytail: 1 ms poll on this thread; the CE
++ * interrupts would let it sleep): queued Ethernet frames out as
++ * native-wifi data, received frames go in through wl_rx_msdu.
++ */
++static void
++wl_run(void)
++{
++	static uint8_t fr[ETHER_MAX_LEN];
++	uint32_t events = 0;
++	for (;;) {
++		mbuf_t m = NULL;
++		lck_mtx_lock(wl_ifq_lock);
++		if (wl_ifq_count) {
++			m = wl_ifq[wl_ifq_head];
++			wl_ifq_head = (wl_ifq_head + 1) % WL_IFQ;
++			wl_ifq_count--;
++		}
++		lck_mtx_unlock(wl_ifq_lock);
++		if (m) {
++			size_t len = mbuf_pkthdr_len(m);
++			if (len > ETHER_HDR_LEN && len <= sizeof(fr) && mbuf_copydata(m, 0, len, fr) == 0) {
++				(void)wl_data_tx(fr, (uint16_t)(fr[12] << 8 | fr[13]), fr + ETHER_HDR_LEN, (uint32_t)(len - ETHER_HDR_LEN));
++			}
++			mbuf_freem(m);
++		}
++		uint8_t eid = wl_htc_poll(0);
++		if (eid == wl_wmi_ep && wl_msg_len >= 4 && wl_noisy(le32(wl_msg) & 0xffffffu) && events++ < 50) {
++			printf("NATRIUM WLAN: WMI event %#x (%u bytes)\n", le32(wl_msg) & 0xffffffu, wl_msg_len);
++		}
++		if (!m && eid == 0xff) {
++			wl_msleep(1);
++		}
++	}
++}
++
++static bool
+ wl_connect(void)
+ {
+ 	if (!wl_crypto_selftest()) {
+@@ -2733,7 +3029,11 @@
+ 	printf("NATRIUM WLAN: CONNECTED to \"%s\" (WPA2-PSK, CCMP)\n", wl_ssid);
+ 	sweet_log_kick();
+ 	wl_step("dhcp");
+-	(void)wl_dhcp();
++	if (!wl_dhcp() || !wl_if_create()) {
++		return false;
++	}
++	sweet_log_kick();
++	wl_run();                                       /* does not return */
+ 	return true;
+ }
+ 

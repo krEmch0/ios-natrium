@@ -1,0 +1,923 @@
+--- a/bsd/dev/natrium_wlan.c
++++ b/bsd/dev/natrium_wlan.c
+@@ -1,6 +1,7 @@
+ /*
+- * Pixel 1 Wi-Fi, stage 1: power the QCA6174 ("Rome") and bring up PCIe root
++ * Pixel 1 Wi-Fi. Stage 1: power the QCA6174 ("Rome") and bring up PCIe root
+  * complex 0, its only host interface, then read the chip's config-space ID.
++ * Stage 2 (below wl_bringup): boot the chip's firmware.
+  * Boot-arg natriumwlan=1 (off by default). Everything is logged ("NATRIUM WLAN:").
+  *
+  * As the Pixel's own kernel (msm-3.18: cnss_pci.c, pci-msm.c; live DT
+@@ -23,8 +24,11 @@
+ #include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
++extern vm_map_address_t phystokv(uint64_t pa);
+ extern kern_return_t thread_terminate(thread_t);
+ extern bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
+ extern bool sweet_rpm_xo_buffer(uint32_t id);
+@@ -212,35 +216,6 @@
+ 	return ok;
+ }
+ 
+-/*
+- * What the PMIC really has (the RPM acks votes either way): STATUS (0x08),
+- * VOLTAGE_CTL2 (0x41), EN_CTL (0x46) of the WLAN/PCIe rails (PM8994 SID 1,
+- * qcom_spmi-regulator map: S1 0x1400 + 0x300 n, L1 0x4000 + 0x100 n) and of
+- * the clock buffer peripherals (SID 0, 0x5000-0x5500).
+- */
+-static void
+-wl_pmic_dump(const char *when)
+-{
+-	static const struct { const char *name; uint16_t ppid; } p[] = {
+-		{"S3", 0x11a}, {"S4", 0x11d}, {"L12", 0x14b}, {"L28", 0x15b}, {"L30", 0x15d},
+-		{"clk50", 0x050}, {"clk51", 0x051}, {"clk52", 0x052}, {"clk53", 0x053},
+-		{"clk54", 0x054}, {"clk55", 0x055},
+-		{"gpio8", 0x0c7}, {"gpio9", 0x0c8}, {"gpio18", 0x0d1},
+-	};
+-	for (unsigned i = 0; i < sizeof(p) / sizeof(p[0]); i++) {
+-		uint8_t type = 0, sub = 0, st = 0, v = 0, en = 0, mode = 0;
+-		bool ok = sweet_pmic_read(p[i].ppid, 0x04, &type);
+-		(void)sweet_pmic_read(p[i].ppid, 0x05, &sub);
+-		(void)sweet_pmic_read(p[i].ppid, 0x08, &st);
+-		(void)sweet_pmic_read(p[i].ppid, 0x41, &v);
+-		(void)sweet_pmic_read(p[i].ppid, 0x46, &en);
+-		(void)sweet_pmic_read(p[i].ppid, 0x45, &mode);
+-		/* GPIOs: status bit 0 = the level on the pin, 0x41 = VIN */
+-		printf("NATRIUM WLAN: pmic %s %s (ppid %#x): type %#x/%#x status %#x vset %#x mode %#x en %#x%s\n", when,
+-		    p[i].name, p[i].ppid, type, sub, st, v, mode, en, ok ? "" : " (read failed)");
+-	}
+-}
+-
+ /* Register dump in pci-msm's layout (8 words a line), to diff against Linux's. */
+ static void
+ wl_dump(const char *name, vm_offset_t base, uint32_t size)
+@@ -260,30 +235,7 @@
+ 	sweet_log_kick();
+ }
+ 
+-/* Every PM8994 rail (SID 1): S1-S12 at 0x1400 + 0x300 n, L1-L32 at 0x4000 + 0x100 n, LVS1/2 0x8000/0x8100. */
+ static void
+-wl_rails_dump(void)
+-{
+-	char line[512];
+-	int n = 0;
+-	for (unsigned i = 0; i < 12 + 32 + 2; i++) {
+-		uint16_t ppid = i < 12 ? (uint16_t)(0x114 + 3 * i) : i < 44 ? (uint16_t)(0x140 + (i - 12)) : (uint16_t)(0x180 + (i - 44));
+-		uint8_t st = 0, en = 0, mode = 0;
+-		bool ok = sweet_pmic_read(ppid, 0x08, &st);
+-		(void)sweet_pmic_read(ppid, 0x46, &en);
+-		(void)sweet_pmic_read(ppid, 0x45, &mode);
+-		char name[8];
+-		snprintf(name, sizeof(name), i < 12 ? "S%u" : i < 44 ? "L%u" : "LVS%u",
+-		    i < 12 ? i + 1 : i < 44 ? i - 11 : i - 43);
+-		n += snprintf(line + n, sizeof(line) - n, " %s=%s%02x/%02x", name, ok ? "" : "?", st, mode);
+-		if (n > 400 || i == 45) {
+-			printf("NATRIUM WLAN: rails%s\n", line);
+-			n = 0;
+-		}
+-	}
+-}
+-
+-static void
+ wl_phy_common(void)
+ {
+ 	static const uint16_t seq[][2] = {
+@@ -404,7 +356,6 @@
+ 	printf("NATRIUM WLAN: clkreq cfg %#x, wake cfg %#x\n", rd(wl_clkreq, 0), rd(wl_wake, 0));
+ 	wl_msleep(1);
+ 
+-	wl_pmic_dump("before");
+ 	/* Rails and the reference clock. */
+ 	(void)sweet_rpm_smpa(3, 1300000);       /* vdd-wlan-core */
+ 	(void)sweet_rpm_smpa(4, 1800000);       /* vdd-wlan-io */
+@@ -558,8 +509,6 @@
+ 	 * Now the chip, then PERST, as quickly as cnss + pci-msm do it (TWRP:
+ 	 * WLAN_EN high -> PERST release ~25 ms): the PCIe side is ready first.
+ 	 */
+-	wl_pmic_dump("at link");
+-	wl_rails_dump();
+ 	wl_step("chip on + link");
+ 	{
+ 		uint8_t s8 = 0, s9 = 0;
+@@ -617,13 +566,815 @@
+ 	    id == 0x003e168cu ? " = QCA6174" : "");
+ 	return id == 0x003e168cu;
+ }
++
++/*
++ * Stage 2: BAR0, then the chip's boot ROM (BMI) through its copy engines,
++ * as qcacld-2.0 (the Pixel's driver: hif_pci.c HIF_PCIDeviceProbed, bmi.c,
++ * ol_fw.c ol_configure_target + ol_download_firmware) with ath10k for the
++ * register layout: early config over the diagnostic CE 7, target info, PLL,
++ * OTP, board data, firmware, BMI_DONE, then HTC READY on CE 1.
++ * Firmware from the payload (mkpayload --blob WLAN-OTP=otp30.bin,
++ * WLAN-BDF=bdwlan30.bin, WLAN-BDF-80/-82=bdwlan30.b80/.b82,
++ * WLAN-FW=qwlan30.bin: the phone's own /vendor/firmware, not in git).
++ * No interrupts: everything polls.
++ */
++#define WL_BAR_PA       0x0c400000u     /* BAR0 (2 MB) in RC0's memory window 0xc300000 + 13 MB */
++#define WL_DMA_PA       0xa0000000u     /* low-bank DRAM: not XNU's (upper bank), no carve-out, < 4 GB (CE addresses are 32-bit) */
++#define WL_DMA_SIZE     0x20000u
++#define WL_SMMU_PA      0x01640000u     /* anoc0 SMMU (pcie0 iommus) */
+ 
++/* QCA6174 BAR0 (ath10k hw.c qca6174_regs = qcacld ar6320v2def.h) */
++#define Q_SOC_CORE      0x3a000u        /* CORE_CTRL; bit 13 = interrupt the target CPU */
++#define Q_FW_IND        0x3a028u
++#define Q_CHIP_ID       0x008f0u        /* RTC_SOC 0x800 + 0xf0 */
++#define Q_RTC_SOC       0x00800u
++#define Q_RTC_WMAC      0x01000u
++#define Q_RTC_STATE     0x80000u        /* PCIE_LOCAL: [2:0] 3 = on */
++#define Q_SOC_WAKE      0x80004u
++#define Q_CE(n)         (0x34400u + 0x400u * (n))
++#define CE_SR_BA        0x00u
++#define CE_SR_SIZE      0x04u
++#define CE_DR_BA        0x08u
++#define CE_DR_SIZE      0x0cu
++#define CE_CTRL1        0x10u           /* [15:0] dmax, 16/17 src/dst byte swap */
++#define CE_HOST_IE      0x2cu
++#define CE_MISC_IE      0x34u
++#define CE_SR_WR        0x3cu
++#define CE_DR_WR        0x40u
++#define CE_SRRI         0x44u
++#define CE_DRRI         0x48u
++#define CE_SRC_WM       0x4cu
++#define CE_DST_WM       0x50u
++
++/* Target RAM: host interest area (targaddrs.h) */
++#define HI(o)           (0x00400800u + (o))
++#define HI_APP_HOST     0x00u
++#define HI_OPTION       0x10u
++#define HI_SERIAL       0x14u
++#define HI_BE           0x44u
++#define HI_BOARD_DATA   0x54u
++#define HI_BOARD_INIT   0x58u
++#define HI_OPTION2      0xccu
++#define HI_INTERCONNECT 0xf8u
++#define HI_EARLY_ALLOC  0x100u
++#define HI_FW_SWAP      0x104u
++#define BMI_SEGMENTED   0x1234u         /* "SGMT" files: the ROM places the segments */
++
++/* DMA area: rings (8-byte descriptors: address, nbytes | flags << 16), BMI buffers, rx buffers */
++#define D_CE0_SRC       0x0400u         /* 16; ring offset 0 means "no ring" in struct wl_ce */
++#define D_CE1_DST       0x0500u         /* 16 */
++#define D_CE7_SRC       0x0600u         /* 2 */
++#define D_CE7_DST       0x0700u         /* 2 */
++#define D_REQ           0x1000u
++#define D_RESP          0x1400u
++#define D_DIAG          0x2000u         /* 2 KB */
++#define D_RX            0x4000u         /* 15 x 2 KB, CE 1 after BMI */
++
++static vm_offset_t wl_bar, wl_dma, wl_smmu;
++
++struct wl_ce {
++	uint32_t reg, src, dst, mask;   /* BAR offset, ring offsets in the DMA area, entries - 1 */
++	uint32_t swr, dwr, drd;         /* src write index, dst write and read index */
++};
++static struct wl_ce ce0 = { Q_CE(0), D_CE0_SRC, 0, 15 };
++static struct wl_ce ce1 = { Q_CE(1), 0, D_CE1_DST, 15 };
++static struct wl_ce ce7 = { Q_CE(7), D_CE7_SRC, D_CE7_DST, 1 };
++
+ static void
++wl_ce_init(struct wl_ce *c, uint32_t dmax)
++{
++	uint32_t n = c->mask + 1;
++	wr(wl_bar, c->reg + CE_HOST_IE, 0);
++	wr(wl_bar, c->reg + CE_MISC_IE, 0);
++	if (c->src) {
++		c->swr = rd(wl_bar, c->reg + CE_SR_WR) & c->mask;
++		wr(wl_bar, c->reg + CE_SR_BA, WL_DMA_PA + c->src);
++		wr(wl_bar, c->reg + CE_SR_SIZE, n);
++		wr(wl_bar, c->reg + CE_CTRL1, (rd(wl_bar, c->reg + CE_CTRL1) & ~0x3ffffu) | dmax);
++		wr(wl_bar, c->reg + CE_SRC_WM, n);
++	}
++	if (c->dst) {
++		c->dwr = rd(wl_bar, c->reg + CE_DR_WR) & c->mask;
++		c->drd = rd(wl_bar, c->reg + CE_DRRI) & c->mask;
++		wr(wl_bar, c->reg + CE_DR_BA, WL_DMA_PA + c->dst);
++		wr(wl_bar, c->reg + CE_DR_SIZE, n);
++		wr(wl_bar, c->reg + CE_CTRL1, rd(wl_bar, c->reg + CE_CTRL1) & ~(1u << 17));
++		wr(wl_bar, c->reg + CE_DST_WM, n);
++	}
++}
++
++static void
++wl_ce_send(struct wl_ce *c, uint32_t pa, uint32_t len, uint16_t flags)
++{
++	volatile uint32_t *d = (volatile uint32_t *)(wl_dma + c->src + 8 * c->swr);
++	d[0] = pa;
++	d[1] = len | (uint32_t)flags << 16;
++	c->swr = (c->swr + 1) & c->mask;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(wl_bar, c->reg + CE_SR_WR, c->swr);
++}
++
++static void
++wl_ce_post(struct wl_ce *c, uint32_t pa)
++{
++	volatile uint32_t *d = (volatile uint32_t *)(wl_dma + c->dst + 8 * c->dwr);
++	d[0] = pa;
++	d[1] = 0;
++	c->dwr = (c->dwr + 1) & c->mask;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(wl_bar, c->reg + CE_DR_WR, c->dwr);
++}
++
++/* Bytes the CE wrote into the oldest posted buffer (consumed), 0 while it is empty. */
++static uint32_t
++wl_ce_recv(struct wl_ce *c)
++{
++	volatile uint32_t *d = (volatile uint32_t *)(wl_dma + c->dst + 8 * c->drd);
++	uint32_t n = d[1] & 0xffffu;
++	if (n) {
++		d[1] = 0;
++		c->drd = (c->drd + 1) & c->mask;
++	}
++	return n;
++}
++
++static void
++wl_smmu_dump(const char *when)
++{
++	uint32_t idr0 = rd(wl_smmu, 0x20);
++	printf("NATRIUM WLAN: smmu %s: sCR0 %#x IDR0 %#x IDR1 %#x sGFSR %#x sGFSYNR0 %#x sGFSYNR1 %#x sGFAR %#x\n",
++	    when, rd(wl_smmu, 0), idr0, rd(wl_smmu, 0x24), rd(wl_smmu, 0x48), rd(wl_smmu, 0x50), rd(wl_smmu, 0x54),
++	    rd(wl_smmu, 0x40));
++	for (uint32_t i = 0; i < (idr0 & 0xffu) && i < 128; i++) {
++		uint32_t smr = rd(wl_smmu, 0x800 + 4 * i), s2cr = rd(wl_smmu, 0xc00 + 4 * i);
++		if ((smr & (1u << 31)) || s2cr) {
++			printf("NATRIUM WLAN: smmu SMR%u %#x S2CR %#x\n", i, smr, s2cr);
++		}
++	}
++	sweet_log_kick();
++}
++
++static void
++wl_ce_dump(const char *why, struct wl_ce *c)
++{
++	printf("NATRIUM WLAN: %s: CE@%#x SR_WR %u SRRI %u DR_WR %u DRRI %u ctrl1 %#x misc_is %#x host_is %#x, fw_ind %#x rtc %#x\n",
++	    why, c->reg, rd(wl_bar, c->reg + CE_SR_WR), rd(wl_bar, c->reg + CE_SRRI), rd(wl_bar, c->reg + CE_DR_WR),
++	    rd(wl_bar, c->reg + CE_DRRI), rd(wl_bar, c->reg + CE_CTRL1), rd(wl_bar, c->reg + 0x38),
++	    rd(wl_bar, c->reg + 0x30), rd(wl_bar, Q_FW_IND), rd(wl_bar, Q_RTC_STATE));
++	wl_smmu_dump(why);
++}
++
++/* PCIe link still up? Read from the controller (DBI/ELBI), never from the chip: a BAR access over a dead link hangs the bus. */
++static bool
++wl_link(const char *where)
++{
++	uint32_t sts = rd(wl_dbi, ELBI_SYS_STTS), lnk = rd(wl_dbi, DBI_LINK_STATUS);
++	bool up = (sts & XMLH_LINK_UP) && (lnk & (1u << 29));
++	if (!up) {
++		printf("NATRIUM WLAN: LINK DOWN at %s (elbi %#x, link status %#x, ltssm %#x)\n", where, sts, lnk,
++		    rd(wl_dbi, 0x728) & 0x3fu);
++		sweet_log_kick();
++	}
++	return up;
++}
++
++/* Wait for tx's last descriptor to go out and (rx) a buffer to come back. */
++static bool
++wl_wait(struct wl_ce *tx, struct wl_ce *rx, uint32_t *rlen, uint32_t ms)
++{
++	bool sent = tx == NULL, got = rx == NULL;
++	for (uint32_t us = 0; us < ms * 1000 && !(sent && got); us += 10) {
++		if (!wl_link("ce wait")) {
++			return false;
++		}
++		sent = sent || (rd(wl_bar, tx->reg + CE_SRRI) & tx->mask) == tx->swr;
++		if (!got) {
++			uint32_t n = wl_ce_recv(rx);
++			if (n) {
++				got = true;
++				*rlen = n;
++			}
++		}
++		if (!(sent && got)) {
++			delay(10);
++		}
++	}
++	return sent && got;
++}
++
++/* Target RAM address in CE space (qcacld TARG_CPU_SPACE_TO_CE_SPACE). */
++static uint32_t
++wl_ce_addr(uint32_t a)
++{
++	return ((rd(wl_bar, Q_SOC_CORE) & 0x7ffu) << 21) | 0x100000u | (a & 0xfffffu);
++}
++
++static bool
++wl_diag_read32(uint32_t a, uint32_t *v)
++{
++	volatile uint32_t *buf = (volatile uint32_t *)(wl_dma + D_DIAG);
++	uint32_t n = 0;
++	buf[0] = 0xdeadbeefu;
++	wl_ce_post(&ce7, WL_DMA_PA + D_DIAG);
++	wl_ce_send(&ce7, wl_ce_addr(a), 4, 0);
++	if (!wl_wait(&ce7, &ce7, &n, 100) || n != 4) {
++		printf("NATRIUM WLAN: diag read %#x FAILED (n %u)\n", a, n);
++		wl_ce_dump("diag", &ce7);
++		return false;
++	}
++	*v = buf[0];
++	return true;
++}
++
++static bool
++wl_diag_write(uint32_t a, const void *src, uint32_t len)
++{
++	uint32_t n = 0;
++	memcpy((void *)(wl_dma + D_DIAG), src, len);
++	wl_ce_post(&ce7, wl_ce_addr(a));
++	wl_ce_send(&ce7, WL_DMA_PA + D_DIAG, len, 0);
++	if (!wl_wait(&ce7, &ce7, &n, 100) || n != len) {
++		printf("NATRIUM WLAN: diag write %#x+%u FAILED (n %u)\n", a, len, n);
++		wl_ce_dump("diag", &ce7);
++		return false;
++	}
++	return true;
++}
++
++/* One BMI message: request in D_REQ (CE 0), response (want bytes) into D_RESP (CE 1). */
++static volatile uint32_t *wl_q, *wl_r;
++
++static bool
++wl_bmi(uint32_t len, uint32_t want)
++{
++	static unsigned traced;
++	uint32_t got = 0;
++	if (!wl_link("bmi")) {
++		return false;
++	}
++	if (traced < 6) {
++		printf("NATRIUM WLAN: bmi msg %u: cmd %u len %u want %u\n", traced, wl_q[0], len, want);
++		sweet_log_kick();
++		wl_msleep(300);
++	}
++	if (want) {
++		wl_ce_post(&ce1, WL_DMA_PA + D_RESP);
++	}
++	wl_ce_send(&ce0, WL_DMA_PA + D_REQ, len, 0xfffcu);     /* transfer id -1, as qcacld */
++	if (traced == 0) {
++		/* 0170a-c reset here: is it the chip's DMA, or our next BAR read? */
++		sweet_log_kick();
++		wl_msleep(200);
++		printf("NATRIUM WLAN: msg 0 sent, 200 ms, no access yet\n");
++		sweet_log_kick();
++		wl_msleep(300);
++		(void)wl_link("msg 0 +500 ms");
++		printf("NATRIUM WLAN: msg 0: link checked, smmu sGFSR %#x sGFSYNR0 %#x\n", rd(wl_smmu, 0x48), rd(wl_smmu, 0x50));
++		sweet_log_kick();
++		wl_msleep(300);
++		printf("NATRIUM WLAN: msg 0: ce0 srri %u\n", rd(wl_bar, ce0.reg + CE_SRRI));
++		sweet_log_kick();
++		wl_msleep(300);
++	}
++	if (!wl_wait(&ce0, want ? &ce1 : NULL, &got, 3000) || got < want) {
++		printf("NATRIUM WLAN: BMI command %u (%#x) FAILED (got %u of %u)\n", wl_q[0], wl_q[1], got, want);
++		wl_ce_dump("bmi tx", &ce0);
++		wl_ce_dump("bmi rx", &ce1);
++		return false;
++	}
++	if (traced < 6) {
++		printf("NATRIUM WLAN: bmi msg %u done (got %u: %#x)\n", traced, got, wl_r[0]);
++		sweet_log_kick();
++		wl_msleep(300);
++	}
++	traced++;
++	return true;
++}
++
++static bool
++bmi_read32(uint32_t a, uint32_t *v)
++{
++	wl_q[0] = 2; wl_q[1] = a; wl_q[2] = 4;
++	if (!wl_bmi(12, 4)) {
++		return false;
++	}
++	*v = wl_r[0];
++	return true;
++}
++
++static bool
++bmi_write(uint32_t a, const void *src, uint32_t len)
++{
++	const uint8_t *s = src;
++	while (len) {
++		uint32_t n = len < 244 ? len : 244, n4 = (n + 3) & ~3u;
++		wl_q[0] = 3; wl_q[1] = a; wl_q[2] = n4;
++		wl_q[3 + n / 4] = 0;            /* zero tail of an unaligned last chunk */
++		memcpy((void *)&wl_q[3], s, n);
++		if (!wl_bmi(12 + n4, 0)) {
++			return false;
++		}
++		a += n; s += n; len -= n;
++	}
++	return true;
++}
++
++static bool
++bmi_write32(uint32_t a, uint32_t v)
++{
++	return bmi_write(a, &v, 4);
++}
++
++static bool
++bmi_execute(uint32_t a, uint32_t *param)
++{
++	wl_q[0] = 4; wl_q[1] = a; wl_q[2] = *param;
++	if (!wl_bmi(12, 4)) {
++		return false;
++	}
++	*param = wl_r[0];
++	return true;
++}
++
++static bool
++bmi_soc_read(uint32_t a, uint32_t *v)
++{
++	wl_q[0] = 6; wl_q[1] = a;
++	if (!wl_bmi(8, 4)) {
++		return false;
++	}
++	*v = wl_r[0];
++	return true;
++}
++
++static bool
++bmi_soc_write(uint32_t a, uint32_t v)
++{
++	wl_q[0] = 7; wl_q[1] = a; wl_q[2] = v;
++	return wl_bmi(12, 0);
++}
++
++static bool
++bmi_lz_start(uint32_t a)
++{
++	wl_q[0] = 13; wl_q[1] = a;
++	return wl_bmi(8, 0);
++}
++
++/* BMIFastDownload: a stream at a (whole words, the tail zero-padded), then a fake stream to flush. */
++static bool
++bmi_fast(uint32_t a, const uint8_t *src, uint32_t len)
++{
++	if (!bmi_lz_start(a)) {
++		return false;
++	}
++	for (uint32_t off = 0; off < len; off += 248) {
++		uint32_t n = len - off < 248 ? len - off : 248, n4 = (n + 3) & ~3u;
++		wl_q[0] = 14; wl_q[1] = n4;
++		wl_q[2 + n / 4] = 0;
++		memcpy((void *)&wl_q[2], src + off, n);
++		if (!wl_bmi(8 + n4, 0)) {
++			printf("NATRIUM WLAN: LZ data failed at %u of %u\n", off, len);
++			return false;
++		}
++	}
++	return bmi_lz_start(0);
++}
++
++/* A firmware file from the payload (/chosen/memory-map NAME = {pa, len}). */
++static const uint8_t *
++wl_blob(const char *name, uint32_t *len)
++{
++	DTEntry node;
++	uint64_t const *v;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) != kSuccess ||
++	    SecureDTGetProperty(node, name, (void const **)&v, &size) != kSuccess || size != 16) {
++		return NULL;
++	}
++	*len = (uint32_t)v[1];
++	return (const uint8_t *)phystokv(v[0]);
++}
++
++/* Target CE pipes and the service map (qcacld target_CE_config_wlan, target_service_to_CE_map_wlan). */
++static const uint32_t wl_pipes[] = {
++	0, 2, 32, 256, 0, 0,            /* CE0 out: HTC control */
++	1, 1, 32, 2048, 0, 0,           /* CE1 in: HTT + HTC control */
++	2, 1, 32, 2048, 0, 0,           /* CE2 in: WMI */
++	3, 2, 32, 2048, 0, 0,           /* CE3 out: WMI */
++	4, 2, 256, 256, 0, 0,           /* CE4 out: HTT */
++	5, 2, 32, 2048, 0, 0,           /* CE5 unused */
++	6, 3, 32, 4096, 0, 0,           /* CE6 target memcpy */
++};
++static const uint32_t wl_svcs[] = {     /* service, dir (1 in, 2 out), pipe */
++	0x104, 2, 3, 0x104, 1, 2,       /* WMI data VO */
++	0x102, 2, 3, 0x102, 1, 2,       /* BK */
++	0x101, 2, 3, 0x101, 1, 2,       /* BE */
++	0x103, 2, 3, 0x103, 1, 2,       /* VI */
++	0x100, 2, 3, 0x100, 1, 2,       /* WMI control */
++	0x001, 2, 0, 0x001, 1, 1,       /* HTC control */
++	0xfe00, 2, 0, 0xfe00, 1, 1,     /* raw streams */
++	0x300, 2, 4, 0x300, 1, 1,       /* HTT data */
++	0, 0, 0,
++};
++
++/* HIF_PCIDeviceProbed: CE config + service map + flags into the target, then release its boot. */
++static bool
++wl_early_config(uint32_t chip)
++{
++	uint32_t state = 0, pipes = 0, svcs = 0, flags = 0, ealloc = 0, opt2 = 0;
++	if (!wl_diag_read32(HI(HI_INTERCONNECT), &state) || !state ||
++	    !wl_diag_read32(state + 0, &pipes) || !pipes ||
++	    !wl_diag_write(pipes, wl_pipes, sizeof(wl_pipes)) ||
++	    !wl_diag_read32(state + 4, &svcs) || !svcs ||
++	    !wl_diag_write(svcs, wl_svcs, sizeof(wl_svcs)) ||
++	    !wl_diag_read32(state + 32, &flags)) {
++		printf("NATRIUM WLAN: early config: pcie_state %#x pipes %#x svcs %#x\n", state, pipes, svcs);
++		return false;
++	}
++	flags &= ~1u;                   /* no L1 (ath10k; qcacld also sets CLK_SWITCH_WAIT: 0170a/b died at the first BMI message) */
++	uint32_t rev = (chip >> 8) & 0xfu, banks = rev == 2 ? 2 : (rev == 4 || rev == 5) ? 6 : rev >= 8 ? 9 : 3;
++	if (!wl_diag_write(state + 32, &flags, 4) || !wl_diag_read32(HI(HI_EARLY_ALLOC), &ealloc)) {
++		return false;
++	}
++	ealloc |= 0x6d8a0000u | banks;  /* HI_EARLY_ALLOC_MAGIC, IRAM banks */
++	if (!wl_diag_write(HI(HI_EARLY_ALLOC), &ealloc, 4) || !wl_diag_read32(HI(HI_OPTION2), &opt2)) {
++		return false;
++	}
++	opt2 |= 0x10;                   /* HI_OPTION_EARLY_CFG_DONE */
++	if (!wl_diag_write(HI(HI_OPTION2), &opt2, 4)) {
++		return false;
++	}
++	wr(wl_bar, Q_SOC_CORE, rd(wl_bar, Q_SOC_CORE) | (1u << 13));      /* wake the target CPU */
++	printf("NATRIUM WLAN: early config: pcie_state %#x pipes %#x svcs %#x flags %#x ealloc %#x opt2 %#x\n",
++	    state, pipes, svcs, flags, ealloc, opt2);
++	return true;
++}
++
++/* ath10k qca6174_clk: div, rnfrac, settle time per EFUSE XTAL_SEL (refdiv 0, outdiv 1). */
++static const uint32_t wl_clk[8][3] = {
++	{0xe, 0x2aaa8, 2400}, {0x24, 0x2aaa8, 960}, {0x1d, 0x15551, 1200}, {0x1b, 0x4ec4, 1300},
++	{0x12, 0x34b49, 1870}, {0x12, 0x15551, 1920}, {0x11, 0x26665, 2000}, {0x1b, 0x4ec4, 2600},
++};
++
++static bool
++wl_pll_wait(void)
++{
++	uint32_t v = 0;
++	for (int i = 0; i < 1000; i++) {
++		if (!bmi_soc_read(Q_RTC_WMAC + 0x244, &v)) {
++			return false;
++		}
++		if (!(v & 0x20)) {      /* RTC_SYNC_STATUS PLL_CHANGING */
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++/* ol_patch_pll_switch (AR6320 v3 addresses): the target CPU off the crystal, at 176 MHz. */
++static bool
++wl_pll(void)
++{
++	uint32_t ef = 0, v = 0;
++	if (!bmi_soc_read(Q_RTC_SOC + 0x32c, &ef)) {
++		return false;
++	}
++	const uint32_t *k = wl_clk[(ef >> 8) & 7];
++	printf("NATRIUM WLAN: efuse %#x: xtal sel %u\n", ef, (ef >> 8) & 7);
++	return bmi_soc_read(Q_RTC_SOC + 0x2f4, &v) &&
++	       bmi_soc_write(Q_RTC_SOC + 0x2f4, (v & ~0x1fffffu) | k[1] | (1u << 18)) &&      /* BB_PLL_CONFIG frac, outdiv 1 */
++	       bmi_soc_read(Q_RTC_WMAC + 0x18, &v) &&
++	       bmi_soc_write(Q_RTC_WMAC + 0x18, (v & ~0x7ffu) | k[2]) &&                     /* WLAN_PLL_SETTLE */
++	       bmi_soc_read(Q_RTC_SOC + 0x114, &v) &&
++	       bmi_soc_write(Q_RTC_SOC + 0x114, (v & ~7u) | 1u) &&                           /* SOC_CORE_CLK_CTRL div 1 */
++	       bmi_write32(0x404028, 1) &&                                                   /* CORE_CLK_DIV */
++	       bmi_soc_read(Q_RTC_WMAC + 0x14, &v) &&
++	       bmi_soc_write(Q_RTC_WMAC + 0x14, (v & ~0x43fffu) | k[0] | (1u << 18)) &&      /* PLL_CONTROL div, refdiv 0, NOPWD */
++	       wl_pll_wait() &&
++	       bmi_soc_read(Q_RTC_WMAC + 0x14, &v) &&
++	       bmi_soc_write(Q_RTC_WMAC + 0x14, v & ~(1u << 16)) &&                          /* BYPASS off */
++	       wl_pll_wait() &&
++	       bmi_soc_read(Q_RTC_SOC + 0x20, &v) &&
++	       bmi_soc_write(Q_RTC_SOC + 0x20, (v & ~3u) | 1u) &&                            /* SOC_CPU_CLOCK standard */
++	       bmi_soc_read(Q_RTC_WMAC + 0x14, &v) &&
++	       bmi_soc_write(Q_RTC_WMAC + 0x14, v & ~(1u << 18)) &&                          /* NOPWD off */
++	       bmi_write32(0x404020, 1) &&                                                   /* CPU_PLL_INIT_DONE */
++	       bmi_write32(0x404024, 176000000);                                             /* CPU_SPEED */
++}
++
++/* Wait (controller side only) for the link to be up, up to ms. */
++static bool
++wl_link_wait(uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms; i++) {
++		if ((rd(wl_dbi, ELBI_SYS_STTS) & XMLH_LINK_UP) && (rd(wl_dbi, DBI_LINK_STATUS) & (1u << 29))) {
++			return true;
++		}
++		wl_msleep(1);
++	}
++	return wl_link("link wait");
++}
++
++/*
++ * ath10k_pci_cold_reset / qcacld hif_pci_device_reset: SOC_GLOBAL_RESET
++ * (PCIE_LOCAL + 8) bit 0 resets the whole chip including its PCIe core,
++ * RTC_STATE bit 13 follows it. Then BAR0 and the command register are
++ * checked (rewritten if the reset cleared them) and the chip woken again.
++ */
++static bool
++wl_cold_reset(void)
++{
++	printf("NATRIUM WLAN: before cold reset: reset_ctrl %#x cpu_clock %#x core_clk %#x lf_timer %#x core_ctrl %#x rtc %#x\n",
++	    rd(wl_bar, Q_RTC_SOC), rd(wl_bar, Q_RTC_SOC + 0x20), rd(wl_bar, Q_RTC_SOC + 0x114), rd(wl_bar, Q_RTC_SOC + 0x50),
++	    rd(wl_bar, Q_SOC_CORE), rd(wl_bar, Q_RTC_STATE));
++	sweet_log_kick();
++	wl_msleep(300);
++	uint32_t v = rd(wl_bar, 0x80008u), rtc = 0;
++	wr(wl_bar, 0x80008u, v | 1u);
++	for (int i = 0; i < 100 && wl_link_wait(100); i++) {
++		rtc = rd(wl_bar, Q_RTC_STATE);
++		if (rtc & 0x2000u) {
++			break;
++		}
++		wl_msleep(1);
++	}
++	printf("NATRIUM WLAN: cold reset asserted: rtc %#x\n", rtc);
++	sweet_log_kick();
++	wl_msleep(20);
++	if (!wl_link_wait(1000)) {
++		return false;
++	}
++	wr(wl_bar, 0x80008u, v & ~1u);
++	for (int i = 0; i < 100 && wl_link_wait(100); i++) {
++		rtc = rd(wl_bar, Q_RTC_STATE);
++		if (!(rtc & 0x2000u)) {
++			break;
++		}
++		wl_msleep(1);
++	}
++	wl_msleep(20);
++	if (!wl_link_wait(1000)) {
++		return false;
++	}
++	printf("NATRIUM WLAN: cold reset released: rtc %#x, bar0 %#x cmd %#x\n", rtc, rd(wl_conf, 0x10), rd(wl_conf, 0x04));
++	sweet_log_kick();
++	if ((rd(wl_conf, 0x10) & ~0xfu) != WL_BAR_PA) {
++		wr(wl_conf, 0x10, WL_BAR_PA);
++		wr(wl_conf, 0x14, 0);
++	}
++	wr(wl_conf, 0x04, rd(wl_conf, 0x04) | 0x6u);
++	wr(wl_bar, Q_SOC_WAKE, 1);
++	for (int i = 0; i < 500 && (rd(wl_bar, Q_RTC_STATE) & 7u) != 3; i++) {
++		wl_msleep(1);
++	}
++	return true;
++}
++
++static bool
++wl_stage2(void)
++{
++	wl_fast = false;
++	wl_step("bar");
++	wl_bar = wl_map(WL_BAR_PA, 0x200000);
++	wl_dma = ml_io_map_wcomb(WL_DMA_PA, WL_DMA_SIZE);
++	wl_smmu = wl_map(WL_SMMU_PA, 0x10000);
++	if (!wl_bar || !wl_dma || !wl_smmu) {
++		printf("NATRIUM WLAN: stage 2 mapping failed\n");
++		return false;
++	}
++	/* iATU region 1: memory TLPs for the BAR window; the bridge forwards and masters. */
++	wr(wl_dbi, DBI_IATU_VIEWPORT, 1);
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x8, 0);
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x4, 0);                 /* CTRL1: MEM */
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0xc, WL_BAR_PA);
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x10, 0);
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x14, WL_BAR_PA + 0x1fffff);
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x18, WL_BAR_PA);
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x1c, 0);
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x8, 1u << 31);
++	wr(wl_dbi, 0x18, 0x00010100u);                          /* buses: primary 0, secondary 1, subordinate 1 */
++	wr(wl_dbi, 0x20, ((WL_BAR_PA + 0x1fffff) & 0xfff00000u) | (WL_BAR_PA >> 16));  /* memory base/limit */
++	wr(wl_dbi, 0x04, rd(wl_dbi, 0x04) | 0x6u);              /* RC: memory + bus master */
++	wr(wl_conf, 0x10, WL_BAR_PA);                           /* BAR0, 64-bit */
++	wr(wl_conf, 0x14, 0);
++	wr(wl_conf, 0x04, rd(wl_conf, 0x04) | 0x6u);            /* EP: memory + bus master */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("NATRIUM WLAN: bar0 %#x cmd %#x, rc cmd %#x\n", rd(wl_conf, 0x10), rd(wl_conf, 0x04), rd(wl_dbi, 0x04));
++	wl_smmu_dump("before");
++
++	wl_step("wake");
++	wr(wl_bar, Q_SOC_WAKE, 1);
++	uint32_t rtc = 0;
++	for (int i = 0; i < 500 && (rtc & 7u) != 3; i++) {
++		rtc = rd(wl_bar, Q_RTC_STATE);
++		if ((rtc & 7u) != 3) {
++			wl_msleep(1);
++		}
++	}
++	uint32_t chip = rd(wl_bar, Q_CHIP_ID), fw = rd(wl_bar, Q_FW_IND);
++	printf("NATRIUM WLAN: target %s: rtc %#x chip id %#x (version %#x rev %u) fw_ind %#x core_ctrl %#x\n",
++	    (rtc & 7u) == 3 ? "awake" : "ASLEEP", rtc, chip, chip >> 18, (chip >> 8) & 0xfu, fw, rd(wl_bar, Q_SOC_CORE));
++	if ((rtc & 7u) != 3) {
++		return false;
++	}
++
++	wl_step("copy engines");
++	bzero((void *)wl_dma, WL_DMA_SIZE);
++	wl_q = (volatile uint32_t *)(wl_dma + D_REQ);
++	wl_r = (volatile uint32_t *)(wl_dma + D_RESP);
++	/*
++	 * 0170g: neither cold nor warm resets make the ROM set FW_IND INITIALIZED,
++	 * yet it fills in pcie_state: it waits for EARLY_CFG_DONE. Give it the
++	 * config right after a cold reset, with no pauses (the ROM may time out).
++	 */
++	if (!wl_cold_reset()) {
++		return false;
++	}
++	/*
++	 * hif_pci_configure / ath10k_pci_wait_for_target_init (legacy IRQ): wait
++	 * for FW_IND INITIALIZED while re-writing PCIE_INTR_ENABLE (firmware +
++	 * all CEs; "the write might get lost if target has NOT written BAR").
++	 * 0170e-l never enabled it, and the ROM never got to INITIALIZED.
++	 */
++	uint32_t fwi = 0;
++	for (int i = 0; i < 300 && wl_link("target init"); i++) {
++		wr(wl_bar, Q_SOC_CORE + 0x8, 0x400u | 0x7f800u);
++		(void)rd(wl_bar, Q_SOC_CORE + 0x8);
++		fwi = rd(wl_bar, Q_FW_IND);
++		if (fwi & 3u) {
++			break;
++		}
++		wl_msleep(10);
++	}
++	printf("NATRIUM WLAN: target init: fw_ind %#x (%s), intr enable %#x cause %#x\n", fwi,
++	    (fwi & 1u) ? "CRASHED" : (fwi & 2u) ? "initialized" : "TIMEOUT", rd(wl_bar, Q_SOC_CORE + 0x8),
++	    rd(wl_bar, Q_SOC_CORE + 0xc));
++	sweet_log_kick();
++	wl_ce_init(&ce0, 256);
++	wl_ce_init(&ce1, 2048);
++	wl_ce_init(&ce7, 2048);
++	if (!wl_early_config(chip)) {
++		return false;
++	}
++
++	for (int i = 0; i < 10; i++) {        /* the ROM runs now: does the link survive it? */
++		wl_msleep(100);
++		if (!wl_link("after early config")) {
++			return false;
++		}
++		printf("NATRIUM WLAN: +%d ms: fw_ind %#x rtc %#x core_ctrl %#x ce0 sr %#x dr %#x/%u dr_wr %u drri %u\n", 100 * (i + 1),
++		    rd(wl_bar, Q_FW_IND), rd(wl_bar, Q_RTC_STATE), rd(wl_bar, Q_SOC_CORE), rd(wl_bar, ce0.reg + CE_SR_BA),
++		    rd(wl_bar, ce0.reg + CE_DR_BA), rd(wl_bar, ce0.reg + CE_DR_SIZE), rd(wl_bar, ce0.reg + CE_DR_WR),
++		    rd(wl_bar, ce0.reg + CE_DRRI));
++		sweet_log_kick();
++	}
++	/*
++	 * The chip's side of CE 0 (its receive ring) belongs to the ROM: with
++	 * no ring the engine fetches descriptors from address 0, over PCIe
++	 * into the phone's protected low memory (0170a-d: reset at the first
++	 * BMI message). Dump all CEs and wait for that ring.
++	 */
++	for (int ce = 0; ce < 8; ce++) {
++		uint32_t b = Q_CE(ce);
++		printf("NATRIUM WLAN: CE%d sr %#x/%u dr %#x/%u ctrl1 %#x sr_wr %u srri %u dr_wr %u drri %u\n", ce,
++		    rd(wl_bar, b + CE_SR_BA), rd(wl_bar, b + CE_SR_SIZE), rd(wl_bar, b + CE_DR_BA), rd(wl_bar, b + CE_DR_SIZE),
++		    rd(wl_bar, b + CE_CTRL1), rd(wl_bar, b + CE_SR_WR), rd(wl_bar, b + CE_SRRI), rd(wl_bar, b + CE_DR_WR),
++		    rd(wl_bar, b + CE_DRRI));
++	}
++	sweet_log_kick();
++	bool ready = false;
++	for (int i = 0; i < 500 && !ready; i++) {
++		ready = rd(wl_bar, ce0.reg + CE_DR_SIZE) != 0 && rd(wl_bar, ce0.reg + CE_DR_BA) != 0 &&
++		    rd(wl_bar, ce0.reg + CE_SR_BA) == WL_DMA_PA + D_CE0_SRC;
++		if (!ready) {
++			wl_msleep(10);
++		}
++	}
++	if (!ready) {
++		printf("NATRIUM WLAN: the ROM never set up its CE 0 receive ring (fw_ind %#x, core_ctrl %#x): no BMI\n",
++		    rd(wl_bar, Q_FW_IND), rd(wl_bar, Q_SOC_CORE));
++		return false;
++	}
++	wl_step("bmi");
++	if (!bmi_lz_start(0)) {         /* harmless first message: does BMI answer at all? */
++		return false;
++	}
++	wl_q[0] = 8;                    /* GET_TARGET_INFO */
++	if (!wl_bmi(4, 8)) {
++		return false;
++	}
++	printf("NATRIUM WLAN: BMI target info: size %u version %#x type %u\n", wl_r[0], wl_r[1], wl_r[2]);
++
++	/* ol_configure_target */
++	uint32_t opt = 0, opt2 = 0;
++	if (!bmi_write32(HI(HI_APP_HOST), 2) ||         /* HTC_PROTOCOL_VERSION */
++	    !bmi_read32(HI(HI_OPTION), &opt) ||
++	    !bmi_write32(HI(HI_OPTION), opt | 1u << 9 | 2u << 12 | 1u << 3) ||   /* 1 device, AP mode, MAC addr method 1 */
++	    !bmi_read32(HI(HI_OPTION2), &opt2) ||
++	    !bmi_write32(HI(HI_OPTION2), opt2 | 0x20 | 0x80) ||  /* DISABLE_CDC_MAX_PERF_WAR, DBUART (Pixel ini gEnableLpassSupport=1) */
++	    !bmi_write32(HI(HI_BE), 0) || !bmi_write32(HI(HI_FW_SWAP), 0) ||
++	    !bmi_write32(HI(0xbc), 0x003e)) {    /* hi_hci_uart_pwr_mgmt_params_ext = PCI device ID (ath10k) */
++		return false;
++	}
++
++	/* ol_download_firmware */
++	wl_step("pll");
++	if (!wl_pll()) {
++		printf("NATRIUM WLAN: PLL switch FAILED\n");
++		return false;
++	}
++	uint32_t otp_len = 0, fw_len = 0, bd_len = 0;
++	const uint8_t *otp = wl_blob("WLAN-OTP", &otp_len), *fwb = wl_blob("WLAN-FW", &fw_len);
++	if (!otp || !fwb) {
++		printf("NATRIUM WLAN: no WLAN-OTP/WLAN-FW in the payload\n");
++		return false;
++	}
++	wl_step("otp");
++	uint32_t param = 0x10;          /* BMI_PARAM_GET_EEPROM_BOARD_ID */
++	if (!bmi_fast(BMI_SEGMENTED, otp, otp_len) || !bmi_execute(BMI_SEGMENTED, &param)) {
++		return false;
++	}
++	uint32_t board = (param & 0xff) ? 0 : (param >> 8) & 0xffff, bd_addr = 0;
++	char bd_name[16];
++	snprintf(bd_name, sizeof(bd_name), board ? "WLAN-BDF-%02x" : "WLAN-BDF", board & 0xff);
++	const uint8_t *bd = wl_blob(bd_name, &bd_len);
++	if (!bd) {
++		bd = wl_blob("WLAN-BDF", &bd_len);
++	}
++	if (!bd || !bmi_read32(HI(HI_BOARD_DATA), &bd_addr)) {
++		printf("NATRIUM WLAN: OTP param %#x board %#x: no %s\n", param, board, bd_name);
++		return false;
++	}
++	printf("NATRIUM WLAN: OTP param %#x: board id %#x -> %s (%u bytes) at %#x\n", param, board, bd_name, bd_len, bd_addr);
++	wl_step("board data");
++	param = 0;
++	if (!bmi_write(bd_addr, bd, bd_len) || !bmi_write32(HI(HI_BOARD_INIT), 1) ||
++	    !bmi_execute(BMI_SEGMENTED, &param)) {
++		return false;
++	}
++	wl_step("firmware");
++	uint64_t t0 = mach_absolute_time();
++	if (!bmi_fast(BMI_SEGMENTED, fwb, fw_len)) {
++		return false;
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("NATRIUM WLAN: firmware %u bytes in %llu ms\n", fw_len, ns / 1000000);
++	if (!bmi_write32(HI(HI_SERIAL), 0) || !bmi_read32(HI(HI_OPTION), &opt) ||
++	    !bmi_write32(HI(HI_OPTION), opt & ~0x40u)) {  /* firmware log on (Pixel ini gEnablefwlog=1) */
++		return false;
++	}
++
++	wl_step("bmi done");
++	for (uint32_t i = 0; i < 14; i++) {    /* HTC READY lands here: posted before BMI_DONE */
++		wl_ce_post(&ce1, WL_DMA_PA + D_RX + 2048 * i);
++	}
++	wl_q[0] = 1;
++	if (!wl_bmi(4, 0)) {
++		return false;
++	}
++	uint32_t n = 0;
++	for (int i = 0; i < 5000 && !n; i++) {
++		n = wl_ce_recv(&ce1);
++		if (!n) {
++			wl_msleep(1);
++		}
++	}
++	const volatile uint32_t *m = (const volatile uint32_t *)(wl_dma + D_RX);
++	printf("NATRIUM WLAN: after BMI_DONE: fw_ind %#x, CE1 message %u bytes: %08x %08x %08x %08x %08x %08x\n",
++	    rd(wl_bar, Q_FW_IND), n, m[0], m[1], m[2], m[3], m[4], m[5]);
++	if (!n) {
++		wl_ce_dump("no htc", &ce1);
++	}
++	uint32_t fs = 0;
++	if ((rd(wl_bar, Q_FW_IND) & 1u) && wl_diag_read32(HI(0x04), &fs) && fs) {
++		/* Firmware crash: hi_failure_state -> register dump (ath10k_pci_dump_registers, 60 words). */
++		uint32_t w[60] = { 0 };
++		for (int i = 0; i < 60 && wl_diag_read32(fs + 4 * i, &w[i]); i++) {
++		}
++		printf("NATRIUM WLAN: FIRMWARE CRASH, dump at %#x:\n", fs);
++		for (int i = 0; i < 60; i += 6) {
++			printf("NATRIUM WLAN: crash[%02d] %08x %08x %08x %08x %08x %08x\n", i, w[i], w[i + 1], w[i + 2],
++			    w[i + 3], w[i + 4], w[i + 5]);
++		}
++		sweet_log_kick();
++	}
++	return n != 0;
++}
++
++static void
+ wl_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+ 	wl_msleep(20000);       /* after boot: the log thread runs, iOS is up */
+ 	bool ok = wl_bringup();
+ 	printf("NATRIUM WLAN: stage 1 %s\n", ok ? "done: QCA6174 on PCIe" : "FAILED");
++	if (ok) {
++		ok = wl_stage2();
++		printf("NATRIUM WLAN: stage 2 %s\n", ok ? "done: firmware up, HTC READY" : "FAILED");
++		sweet_log_kick();
++	}
+ 	thread_terminate(current_thread());
+ }
+ 

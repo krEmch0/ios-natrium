@@ -1,0 +1,913 @@
+--- a/bsd/dev/natrium_wlan.c
++++ b/bsd/dev/natrium_wlan.c
+@@ -25,6 +25,9 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include <libkern/crypto/sha1.h>
++#include <libkern/crypto/aes.h>
++#include <sys/random.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+@@ -1430,7 +1433,40 @@
+ #define TAG_READY               0x23u
+ 
+ static uint8_t wl_wmi_ep = 0xff, wl_htt_ep = 0xff, wl_seq[8], wl_mac[6];
+-static uint32_t wl_htt_alloc, wl_htt_rx;       /* HTT rx ring: host write index, MSDUs indicated */
++static uint32_t wl_htt_alloc, wl_htt_rd, wl_htt_rx;    /* HTT rx ring: host write and read index, MSDUs indicated */
++static uint32_t wl_htt_types;                   /* HTT T2H message types seen (logged once each) */
++static int32_t wl_txc_id = -1;                  /* last HTT tx completion: msdu id, status */
++static uint32_t wl_txc_status;
++static uint8_t wl_eapol[512], wl_ip[1600];     /* last EAPOL-Key frame and IPv4 packet received */
++static uint32_t wl_eapol_len, wl_ip_len;
++
++/*
++ * One received MSDU (native-wifi decap: 802.11 header without QoS, then
++ * LLC/SNAP). Keep EAPOL and IPv4 payloads for the waiters.
++ */
++static void
++wl_rx_msdu(const volatile uint8_t *p, uint32_t len, uint32_t att)
++{
++	if (wl_htt_rx < 6) {
++		printf("NATRIUM WLAN: rx msdu len %u att %#x fc %02x%02x\n", len, att, p[0], p[1]);
++	}
++	wl_htt_rx++;
++	for (uint32_t o = 24; o + 8 <= len && o <= 32; o += 2) {        /* header: 24, 26 (QoS), 30 (4 addr), 32 */
++		if (p[o] != 0xaa || p[o + 1] != 0xaa || p[o + 2] != 3 || p[o + 3] || p[o + 4] || p[o + 5]) {
++			continue;
++		}
++		uint16_t type = (uint16_t)(p[o + 6] << 8 | p[o + 7]);
++		uint8_t *dst = type == 0x888e ? wl_eapol : type == 0x0800 ? wl_ip : NULL;
++		uint32_t n = len - o - 8, max = type == 0x888e ? sizeof(wl_eapol) : sizeof(wl_ip);
++		if (dst && n <= max) {
++			for (uint32_t i = 0; i < n; i++) {
++				dst[i] = p[o + 8 + i];
++			}
++			*(type == 0x888e ? &wl_eapol_len : &wl_ip_len) = n;
++		}
++		return;
++	}
++}
+ 
+ /* Send an HTC frame (payload already at D_TX + 8 + CE slot) on eid through CE c. */
+ static bool
+@@ -1510,19 +1546,77 @@
+ 				}
+ 				r += 4 + rl;
+ 			}
++			if (eid == wl_htt_ep && len - tl >= 1 && f[8] < 32 && !(wl_htt_types & (1u << f[8]))) {
++				wl_htt_types |= 1u << f[8];
++				printf("NATRIUM WLAN: HTT msg type %u (%u bytes)\n", f[8], len - tl);
++			}
+ 			if (eid == wl_htt_ep && len - tl >= 48 && f[8] == 1) {
+ 				/*
+-				 * HTT RX_IND: the firmware filled ring buffers. Sum the MPDU ranges
+-				 * (one buffer per MPDU here) and hand the slots back: slot i always
+-				 * holds buffer i, so advancing the alloc index recycles them.
++				 * HTT RX_IND: the firmware filled ring buffers in order. Per MPDU,
++				 * take MSDUs from the read index up to the one marked last
++				 * (htt_rx_desc_v1: attention +4, msdu_start +24, msdu_end info0
++				 * +56, payload +300) and hand each slot back: slot i always holds
++				 * buffer i, so advancing the alloc index recycles them.
+ 				 */
+-				uint32_t nr = f[8 + 7], fwd = f[8 + 44] | (uint32_t)f[8 + 45] << 8, ro = 8 + 48 + ((fwd + 3) & ~3u), cnt = 0;
++				uint32_t nr = f[8 + 7], fwd = f[8 + 44] | (uint32_t)f[8 + 45] << 8, ro = 8 + 48 + ((fwd + 3) & ~3u);
+ 				for (uint32_t i = 0; i < nr && ro + 4 * i + 4 <= 8 + len; i++) {
+-					cnt += f[ro + 4 * i];
++					for (uint32_t m = 0; m < f[ro + 4 * i]; m++) {
++						for (int guard = 0; guard < 8; guard++) {
++							volatile uint8_t *b = (volatile uint8_t *)(wl_dma + D_HTT_BUF + 2048 * wl_htt_rd);
++							volatile uint32_t *d = (volatile uint32_t *)b;
++							uint32_t att = d[1], ml = d[6] & 0x3fffu;
++							bool last = d[14] & (1u << 15);
++							if (att & (1u << 31)) {
++								wl_rx_msdu(b + 300, ml < 2048 - 300 ? ml : 2048 - 300, att);
++							}
++							d[1] = 0;
++							wl_htt_rd = (wl_htt_rd + 1) & (HTT_RING_N - 1);
++							wl_htt_alloc = (wl_htt_alloc + 1) & (HTT_RING_N - 1);
++							if (last || !(att & (1u << 31))) {
++								break;
++							}
++						}
++					}
+ 				}
+-				wl_htt_rx += cnt;
++				*(volatile uint32_t *)(wl_dma + D_HTT_IDX) = wl_htt_alloc;
++			}
++			if (eid == wl_htt_ep && len - tl >= 8 && f[8] == 18) {
++				/*
++				 * RX_IN_ORD_PADDR_IND (this firmware's rx path): {info (bit 5
++				 * offload), peer, vdev, count}, then per MSDU {paddr, len}.
++				 * Normal MSDUs keep the rx descriptor in front (payload +300),
++				 * offloaded ones a 9-byte header. Ring slots are consumed in
++				 * order, so advancing the alloc index by count recycles them.
++				 */
++				uint32_t cnt = f[14] | f[15] << 8;
++				bool off = f[9] & 0x20u;
++				for (uint32_t i = 0; i < cnt && 16 + 8 * i + 8 <= 8 + len; i++) {
++					const volatile uint8_t *m = f + 16 + 8 * i;
++					uint32_t pa = m[0] | m[1] << 8 | m[2] << 16 | (uint32_t)m[3] << 24, ml = m[4] | m[5] << 8;
++					uint32_t idx = (pa - (WL_DMA_PA + D_HTT_BUF)) / 2048;
++					if (pa < WL_DMA_PA + D_HTT_BUF || idx >= HTT_RING_N) {
++						printf("NATRIUM WLAN: rx in-order: bad paddr %#x\n", pa);
++						continue;
++					}
++					volatile uint8_t *b = (volatile uint8_t *)(wl_dma + D_HTT_BUF + 2048 * idx);
++					volatile uint32_t *d = (volatile uint32_t *)b;
++					if (off) {
++						ml = b[0] | b[1] << 8;
++						wl_rx_msdu(b + 9, ml < 2048 - 9 ? ml : 2048 - 9, 0);
++					} else {
++						wl_rx_msdu(b + 300, ml < 2048 - 300 ? ml : 2048 - 300, d[1]);
++						d[1] = 0;
++					}
++				}
+ 				wl_htt_alloc = (wl_htt_alloc + cnt) & (HTT_RING_N - 1);
+ 				*(volatile uint32_t *)(wl_dma + D_HTT_IDX) = wl_htt_alloc;
++			}
++			if (eid == wl_htt_ep && len - tl >= 6 && f[8] == 7) {  /* TX_COMPL_IND: status, count, ids */
++				uint32_t nm = f[10];
++				wl_txc_status = f[9] & 7u;
++				if (nm && 12 + 2 * nm <= 8 + len) {
++					wl_txc_id = f[10 + 2 * nm] | f[11 + 2 * nm] << 8;     /* the last one */
++				}
+ 			}
+ 			wl_msg_len = len - tl;
+ 			wl_msg_eid = eid;
+@@ -1807,6 +1901,26 @@
+ 	return i < 13 ? 2412 + 5 * i : 5180 + 20 * (i - 13);
+ }
+ #define WL_NCHAN 17u
++
++/* The network to join (boot-args natriumssid / natriumpsk) and what its beacon said. */
++static char wl_ssid[33], wl_psk[64];
++static struct {
++	uint8_t bssid[6], rsn[64];
++	uint32_t ch, snr, cap, rsn_len;
++	bool found;
++} wl_bss;
++
++/* 802.11 frame of the WMI MGMT_RX event in wl_msg (header TLV, then a byte array); NULL if malformed. */
++static const uint8_t *
++wl_mgmt_frame(uint32_t *flen)
++{
++	uint32_t hl = le32(&wl_msg[4]) & 0xffff, fo = 8 + hl + 4;
++	if (fo + 24 > wl_msg_len) {
++		return NULL;
++	}
++	*flen = le32(&wl_msg[fo - 4]) & 0xffff;
++	return fo + *flen <= wl_msg_len ? &wl_msg[fo] : NULL;
++}
+ 
+ static bool
+ wl_scan(void)
+@@ -1906,14 +2020,9 @@
+ 			done = e == 2;                  /* COMPLETED */
+ 		} else if (ev == WMI_MGMT_RX_EVTID) {
+ 			mgmt++;
+-			uint32_t hl = le32(&wl_msg[4]) & 0xffff, snr = le32(&wl_msg[12]), ch = le32(&wl_msg[8]);
+-			uint32_t fo = 8 + hl + 4;               /* after the header TLV and the byte array's TLV header */
+-			if (fo + 36 > wl_msg_len) {
+-				continue;
+-			}
+-			const uint8_t *fr = &wl_msg[fo], *bssid = fr + 16;
+-			uint32_t flen = (le32(&wl_msg[fo - 4]) & 0xffff);
+-			if ((fr[0] != 0x80 && fr[0] != 0x50) || fo + flen > wl_msg_len) {
++			uint32_t snr = le32(&wl_msg[12]), ch = le32(&wl_msg[8]), flen = 0;
++			const uint8_t *fr = wl_mgmt_frame(&flen), *bssid = fr ? fr + 16 : NULL;
++			if (!fr || flen < 36 || (fr[0] != 0x80 && fr[0] != 0x50)) {
+ 				continue;                       /* beacons and probe responses only */
+ 			}
+ 			bool dup = false;
+@@ -1925,14 +2034,27 @@
+ 			}
+ 			memcpy(seen[nseen++], bssid, 6);
+ 			char ssid[33] = "";
+-			for (uint32_t o = 36; o + 2 <= flen; o += 2 + fr[o + 1]) {
+-				if (fr[o] == 0 && fr[o + 1] <= 32 && o + 2 + fr[o + 1] <= flen) {
++			const uint8_t *rsn = NULL;
++			for (uint32_t o = 36; o + 2 <= flen && o + 2 + fr[o + 1] <= flen; o += 2 + fr[o + 1]) {
++				if (fr[o] == 0 && fr[o + 1] <= 32 && !ssid[0]) {
+ 					for (int i = 0; i < fr[o + 1]; i++) {
+ 						ssid[i] = (fr[o + 2 + i] >= 0x20 && fr[o + 2 + i] < 0x7f) ? (char)fr[o + 2 + i] : '?';
+ 					}
+ 					ssid[fr[o + 1]] = 0;
+-					break;
++				} else if (fr[o] == 0x30 && fr[o + 1] + 2u <= sizeof(wl_bss.rsn)) {
++					rsn = &fr[o];
+ 				}
++			}
++			/* Our network: prefer 2.4 GHz (no passive/DFS rules), then the stronger signal. */
++			if (wl_ssid[0] && strcmp(ssid, wl_ssid) == 0 && rsn &&
++			    (!wl_bss.found || (ch <= 14 && wl_bss.ch > 14) || ((ch <= 14) == (wl_bss.ch <= 14) && snr > wl_bss.snr))) {
++				memcpy(wl_bss.bssid, bssid, 6);
++				wl_bss.ch = ch;
++				wl_bss.snr = snr;
++				wl_bss.cap = fr[34] | fr[35] << 8;
++				wl_bss.rsn_len = rsn[1] + 2u;
++				memcpy(wl_bss.rsn, rsn, wl_bss.rsn_len);
++				wl_bss.found = true;
+ 			}
+ 			printf("NATRIUM WLAN: BSS %02x:%02x:%02x:%02x:%02x:%02x ch %u snr %u \"%s\"\n", bssid[0], bssid[1],
+ 			    bssid[2], bssid[3], bssid[4], bssid[5], ch, snr, ssid);
+@@ -1944,9 +2066,678 @@
+ 	}
+ 	sweet_log_kick();
+ 	return nseen > 0;
++}
++
++/*
++ * Stage 4: join a WPA2-PSK (CCMP) network the way ath10k + mac80211 +
++ * wpa_supplicant do it: vdev start on the BSS channel, peer create,
++ * open-system auth and association (management frames over HTT TX_FRM),
++ * peer assoc + vdev up, then the 4-way handshake with our own supplicant
++ * (EAPOL in native-wifi frames over HTT), PTK/GTK into the firmware, peer
++ * authorized. A DHCP DISCOVER then checks the encrypted data path.
++ */
++#define WMI_VDEV_START_CMDID            0x5003u
++#define WMI_VDEV_UP_CMDID               0x5005u
++#define WMI_VDEV_INSTALL_KEY_CMDID      0x5009u
++#define WMI_PEER_CREATE_CMDID           0x6001u
++#define WMI_PEER_SET_PARAM_CMDID        0x6004u
++#define WMI_PEER_ASSOC_CMDID            0x6005u
++#define WMI_STA_PS_MODE_CMDID           0x9001u
++#define WMI_VDEV_START_RESP_EVTID       0x5001u
++#define WMI_INSTALL_KEY_DONE_EVTID      0x5003u
++#define TAG_VDEV_START                  0x58u
++#define TAG_VDEV_UP                     0x5cu
++#define TAG_INSTALL_KEY                 0x60u
++#define TAG_PEER_CREATE                 0x61u
++#define TAG_PEER_SET_PARAM              0x64u
++#define TAG_PEER_ASSOC                  0x65u
++#define TAG_VHT_RATE_SET                0x66u
++#define TAG_STA_PS_MODE                 0x6cu
++#define D_TXFRAG                        0x21800u        /* HTT tx fragment list: {paddr, len}, {0, 0} */
++#define D_TXF                           0x22000u        /* HTT tx frame, 2 KB */
++
++/* EAPOL-Key frame offsets, 802.1X header included. */
++#define EK_INFO         5
++#define EK_REPLAY       9
++#define EK_NONCE        17
++#define EK_RSC          65
++#define EK_MIC          81
++#define EK_DATA         99      /* key data length at 97 */
++
++/* HMAC-SHA1 over a || b (key at most 64 bytes); out may alias a. */
++static void
++wl_hmac_sha1(const void *key, size_t klen, const void *a, size_t alen, const void *b, size_t blen, uint8_t out[20])
++{
++	uint8_t k[64] = { 0 }, pad[64];
++	SHA1_CTX c;
++	memcpy(k, key, klen);
++	for (int i = 0; i < 64; i++) {
++		pad[i] = k[i] ^ 0x36;
++	}
++	SHA1Init(&c);
++	SHA1Update(&c, pad, 64);
++	SHA1Update(&c, a, alen);
++	if (blen) {
++		SHA1Update(&c, b, blen);
++	}
++	SHA1Final(out, &c);
++	for (int i = 0; i < 64; i++) {
++		pad[i] = k[i] ^ 0x5c;
++	}
++	SHA1Init(&c);
++	SHA1Update(&c, pad, 64);
++	SHA1Update(&c, out, 20);
++	SHA1Final(out, &c);
+ }
+ 
++/* PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32) */
+ static void
++wl_pmk(const char *psk, const char *ssid, uint8_t pmk[32])
++{
++	size_t pl = strlen(psk), sl = strlen(ssid);
++	for (uint8_t blk = 1; blk <= 2; blk++) {
++		uint8_t cnt[4] = { 0, 0, 0, blk }, u[20], t[20];
++		wl_hmac_sha1(psk, pl, ssid, sl, cnt, 4, u);
++		memcpy(t, u, 20);
++		for (int i = 1; i < 4096; i++) {
++			wl_hmac_sha1(psk, pl, u, 20, NULL, 0, u);
++			for (int j = 0; j < 20; j++) {
++				t[j] ^= u[j];
++			}
++		}
++		memcpy(pmk + 20 * (blk - 1), t, blk == 1 ? 20 : 12);
++	}
++}
++
++/* IEEE 802.11 PRF-SHA1: HMAC(key, label || 0 || data || i), i = 0, 1, ... */
++static void
++wl_prf(const uint8_t *key, size_t klen, const char *label, const uint8_t *data, size_t dlen, uint8_t *out, size_t olen)
++{
++	uint8_t buf[128], h[20];
++	size_t ll = strlen(label) + 1;
++	memcpy(buf, label, ll);
++	memcpy(buf + ll, data, dlen);
++	for (uint8_t i = 0; olen; i++) {
++		size_t n = olen < 20 ? olen : 20;
++		buf[ll + dlen] = i;
++		wl_hmac_sha1(key, klen, buf, ll + dlen + 1, NULL, 0, h);
++		memcpy(out, h, n);
++		out += n;
++		olen -= n;
++	}
++}
++
++/* RFC 3394 AES key unwrap (128-bit KEK): len bytes in, len - 8 out. */
++static bool
++wl_unwrap(const uint8_t kek[16], const uint8_t *in, size_t len, uint8_t *out)
++{
++	size_t n = len / 8 - 1;
++	uint8_t a[8], b[16];
++	aes_decrypt_ctx ctx;
++	if (len < 24 || len % 8) {
++		return false;
++	}
++	aes_decrypt_key128(kek, &ctx);
++	memcpy(a, in, 8);
++	memcpy(out, in + 8, 8 * n);
++	for (int j = 5; j >= 0; j--) {
++		for (size_t i = n; i >= 1; i--) {
++			uint64_t t = (uint64_t)n * (uint64_t)j + i;
++			memcpy(b, a, 8);
++			for (int k = 0; k < 8; k++) {
++				b[7 - k] ^= (uint8_t)(t >> (8 * k));
++			}
++			memcpy(b + 8, out + 8 * (i - 1), 8);
++			aes_decrypt(b, b, &ctx);
++			memcpy(a, b, 8);
++			memcpy(out + 8 * (i - 1), b + 8, 8);
++		}
++	}
++	for (int k = 0; k < 8; k++) {
++		if (a[k] != 0xa6) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* Known answers: IEEE 802.11 PSK vector ("password", "IEEE") and RFC 3394 4.1. */
++static bool
++wl_crypto_selftest(void)
++{
++	static const uint8_t pmk_ok[32] = {
++		0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef, 0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a, 0x5f, 0x90,
++		0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2, 0x3a, 0xed, 0x76, 0x2e, 0x97, 0x10, 0xa1, 0x2e
++	};
++	static const uint8_t kek[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
++	static const uint8_t wrapped[24] = {
++		0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8, 0xfb, 0x5a, 0x7b, 0x82,
++		0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5
++	};
++	static const uint8_t plain[16] = {
++		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
++	};
++	uint8_t pmk[32], out[16];
++	wl_pmk("password", "IEEE", pmk);
++	bool ok1 = memcmp(pmk, pmk_ok, 32) == 0, ok2 = wl_unwrap(kek, wrapped, 24, out) && memcmp(out, plain, 16) == 0;
++	printf("NATRIUM WLAN: crypto self-test: PBKDF2 %s, AES unwrap %s\n", ok1 ? "ok" : "FAIL", ok2 ? "ok" : "FAIL");
++	return ok1 && ok2;
++}
++
++static void
++wl_put_mac(uint32_t *w, const uint8_t *m)
++{
++	w[0] = m[0] | m[1] << 8 | m[2] << 16 | (uint32_t)m[3] << 24;
++	w[1] = m[4] | m[5] << 8;
++}
++
++/* Start a WMI command with one fixed-param TLV of len bytes; returns its value (zeroed). */
++static uint32_t *
++wl_wmi_begin(uint32_t cmd, uint32_t tag, uint32_t len)
++{
++	uint32_t *w = (uint32_t *)wl_htc_tx_payload(&ce3);
++	bzero(w, 512);
++	*w++ = cmd;
++	return wl_tlv(w, tag, len);
++}
++
++static uint64_t
++wl_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000;
++}
++
++static bool
++wl_noisy(uint32_t ev)
++{
++	return ev != WMI_MGMT_RX_EVTID && ev != 0x1d011u && ev != 0x4002u;    /* not beacons, fw debug log, chan info */
++}
++
++/* Wait for WMI event id; other events are printed (except the frequent ones). */
++static bool
++wl_wmi_event(uint32_t id, uint32_t ms)
++{
++	for (uint64_t end = wl_ms() + ms; wl_ms() < end;) {
++		if (wl_htc_poll(10) == wl_wmi_ep && wl_msg_len >= 4) {
++			uint32_t ev = le32(wl_msg) & 0xffffffu;
++			if (ev == id) {
++				return true;
++			}
++			if (wl_noisy(ev)) {
++				printf("NATRIUM WLAN: WMI event %#x (%u bytes)\n", ev, wl_msg_len);
++			}
++		}
++	}
++	return false;
++}
++
++/* Wait for a management frame of type fc from the BSS to us. */
++static const uint8_t *
++wl_wait_mgmt(uint8_t fc, uint32_t ms, uint32_t *flen)
++{
++	for (uint64_t end = wl_ms() + ms; wl_ms() < end;) {
++		if (wl_htc_poll(10) != wl_wmi_ep || wl_msg_len < 8) {
++			continue;
++		}
++		uint32_t ev = le32(wl_msg) & 0xffffffu;
++		if (ev != WMI_MGMT_RX_EVTID) {
++			if (wl_noisy(ev)) {
++				printf("NATRIUM WLAN: WMI event %#x (%u bytes)\n", ev, wl_msg_len);
++			}
++			continue;
++		}
++		const uint8_t *fr = wl_mgmt_frame(flen);
++		if (fr && fr[0] == fc && memcmp(fr + 4, wl_mac, 6) == 0 && memcmp(fr + 10, wl_bss.bssid, 6) == 0) {
++			return fr;
++		}
++	}
++	return NULL;
++}
++
++/*
++ * HTT TX_FRM (ath10k_htt_tx_32): the frame goes to D_TXF, the descriptor and
++ * its first bytes (prefetch for the classifier) on CE 4. Management frames
++ * (type MGMT, tid 17) are fetched whole from frags_paddr; data frames
++ * (native wifi, non-QoS tid 16) through a fragment list. Completion: HTT
++ * TX_COMPL_IND with the msdu id (wl_txc_id).
++ */
++static uint16_t wl_tx_id;
++
++static bool
++wl_htt_tx(const uint8_t *fr, uint32_t len, bool mgmt)
++{
++	uint8_t *f = (uint8_t *)(wl_dma + D_TXF), *p = wl_htc_tx_payload(&ce4);
++	volatile uint32_t *frag = (volatile uint32_t *)(wl_dma + D_TXFRAG);
++	uint32_t pre = ((len < 50 ? len : 50) + 3) & ~3u, pa = WL_DMA_PA + (mgmt ? D_TXF : D_TXFRAG);
++	uint16_t flags1 = (uint16_t)((mgmt ? 17u : 16u) << 6 | 1u << 11), id = ++wl_tx_id;
++	memcpy(f, fr, len);
++	frag[0] = WL_DMA_PA + D_TXF;
++	frag[1] = len;
++	frag[2] = frag[3] = 0;
++	p[0] = 1;                                       /* TX_FRM */
++	p[1] = (uint8_t)(1u | (mgmt ? 3u : 1u) << 5);   /* MAC header present, type MGMT / NATIVE_WIFI */
++	p[2] = flags1 & 0xff;                           /* vdev 0, ext tid, POSTPONED */
++	p[3] = flags1 >> 8;
++	p[4] = len & 0xff;
++	p[5] = (uint8_t)(len >> 8);
++	p[6] = id & 0xff;
++	p[7] = (uint8_t)(id >> 8);
++	for (int i = 0; i < 4; i++) {
++		p[8 + i] = (uint8_t)(pa >> (8 * i));
++	}
++	p[12] = p[13] = 0xff;                           /* peer id: invalid; freq 0: home channel */
++	p[14] = p[15] = 0;
++	memcpy(p + 16, f, pre);
++	wl_txc_id = -1;
++	return wl_htc_send(&ce4, wl_htt_ep, 16 + pre);
++}
++
++static bool
++wl_tx_wait(uint32_t ms)
++{
++	for (uint64_t end = wl_ms() + ms; wl_ms() < end && wl_txc_id != wl_tx_id;) {
++		(void)wl_htc_poll(10);
++	}
++	return wl_txc_id == wl_tx_id;
++}
++
++/* 802.11 header to the BSS: A1 BSSID, A2 us, A3 a3. */
++static uint32_t
++wl_hdr(uint8_t *f, uint8_t fc0, uint8_t fc1, const uint8_t *a3)
++{
++	bzero(f, 24);
++	f[0] = fc0;
++	f[1] = fc1;
++	memcpy(f + 4, wl_bss.bssid, 6);
++	memcpy(f + 10, wl_mac, 6);
++	memcpy(f + 16, a3, 6);
++	return 24;
++}
++
++/* Data frame (ToDS) with LLC/SNAP for ethertype. */
++static bool
++wl_data_tx(const uint8_t *da, uint16_t type, const uint8_t *body, uint32_t len)
++{
++	static uint8_t f[2048];
++	uint32_t n = wl_hdr(f, 0x08, 0x01, da);
++	const uint8_t snap[8] = { 0xaa, 0xaa, 3, 0, 0, 0, (uint8_t)(type >> 8), (uint8_t)type };
++	if (n + 8 + len > sizeof(f)) {
++		return false;
++	}
++	memcpy(f + n, snap, 8);
++	memcpy(f + n + 8, body, len);
++	return wl_htt_tx(f, n + 8 + len, false);
++}
++
++static bool
++wl_wmi_simple(uint32_t cmd, uint32_t tag, const uint32_t *v, uint32_t words)
++{
++	uint32_t *w = wl_wmi_begin(cmd, tag, 4 * words);
++	memcpy(w, v, 4 * words);
++	return wl_wmi_send(w + words);
++}
++
++static bool
++wl_install_key(uint32_t idx, uint32_t flags, const uint8_t *key, const uint8_t *rsc)
++{
++	uint32_t *w = wl_wmi_begin(WMI_VDEV_INSTALL_KEY_CMDID, TAG_INSTALL_KEY, 92);
++	wl_put_mac(&w[1], wl_bss.bssid);
++	w[3] = idx;
++	w[4] = flags;                                   /* 0 pairwise, 1 group */
++	w[5] = 4;                                       /* AES_CCM */
++	if (rsc) {
++		w[6] = le32(rsc);
++		w[7] = rsc[4] | rsc[5] << 8;
++	}
++	w[20] = 16;                                     /* key len, no MIC keys */
++	w = wl_tlv(w + 23, TAG_ARRAY_BYTE, 16);
++	memcpy(w, key, 16);
++	if (!wl_wmi_send(w + 4)) {
++		return false;
++	}
++	bool ok = wl_wmi_event(WMI_INSTALL_KEY_DONE_EVTID, 1000);
++	printf("NATRIUM WLAN: key %u (%s) installed: %s status %u\n", idx, flags ? "group" : "pairwise", ok ? "done" : "NO EVENT",
++	    ok ? le32(&wl_msg[8 + 20]) : 0);           /* vdev, peer, key idx, key flags, status */
++	return ok && le32(&wl_msg[8 + 20]) == 0;
++}
++
++/* Our RSN element: group cipher as the AP's, pairwise CCMP, AKM PSK, no capabilities. */
++static uint8_t wl_rsn[22] = { 0x30, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0 };
++
++static bool
++wl_rsn_check(void)
++{
++	const uint8_t *r = wl_bss.rsn, *end = r + wl_bss.rsn_len, *o = r + 8;
++	bool ccmp = false, psk = false;
++	if (wl_bss.rsn_len < 8) {
++		return false;
++	}
++	memcpy(wl_rsn + 4, r + 4, 4);
++	uint32_t n = o + 2 <= end ? (o[0] | o[1] << 8) : 0;
++	for (o += 2; n-- && o + 4 <= end; o += 4) {
++		ccmp |= o[0] == 0 && o[1] == 0x0f && o[2] == 0xac && o[3] == 4;
++	}
++	n = o + 2 <= end ? (o[0] | o[1] << 8) : 0;
++	for (o += 2; n-- && o + 4 <= end; o += 4) {
++		psk |= o[0] == 0 && o[1] == 0x0f && o[2] == 0xac && o[3] == 2;
++	}
++	uint32_t caps = o + 2 <= end ? (o[0] | o[1] << 8) : 0;
++	printf("NATRIUM WLAN: AP RSN: group cipher %u, pairwise CCMP %s, AKM PSK %s, caps %#x\n", r[7], ccmp ? "yes" : "NO",
++	    psk ? "yes" : "NO", caps);
++	return ccmp && psk && r[7] == 4 && !(caps & 0x40);     /* CCMP group; no required MFP */
++}
++
++/* The 4-way handshake: PTK from msg 1, msg 2 back, msg 3 checked, GTK unwrapped, msg 4, keys installed. */
++static bool
++wl_4way(void)
++{
++	static uint8_t e[512], r[EK_DATA + sizeof(wl_rsn)], kd[256];
++	uint8_t pmk[32], ptk[48], snonce[32], anonce[32], gtk[16], gtk_id = 0, rsc[8];
++	bool have_ptk = false, done = false;
++	wl_pmk(wl_psk, wl_ssid, pmk);
++	read_random(snonce, sizeof(snonce));
++	for (uint64_t end = wl_ms() + 10000; wl_ms() < end && !done;) {
++		if (!wl_eapol_len) {
++			(void)wl_htc_poll(10);
++			continue;
++		}
++		uint32_t n = wl_eapol_len;
++		memcpy(e, wl_eapol, n);
++		wl_eapol_len = 0;
++		uint32_t elen = 4u + (e[2] << 8 | e[3]), info = e[EK_INFO] << 8 | e[EK_INFO + 1];
++		uint32_t dlen = e[EK_DATA - 2] << 8 | e[EK_DATA - 1];
++		if (e[1] != 3 || elen > n || elen < EK_DATA || EK_DATA + dlen > elen) {
++			printf("NATRIUM WLAN: EAPOL: not a key frame (type %u len %u of %u)\n", e[1], elen, n);
++			continue;
++		}
++		if ((info & 0x1c8u) == 0x88u) {                 /* msg 1: pairwise, ack, no MIC */
++			uint8_t d[76];
++			bool lo = memcmp(wl_mac, wl_bss.bssid, 6) < 0;
++			memcpy(anonce, e + EK_NONCE, 32);
++			memcpy(d, lo ? wl_mac : wl_bss.bssid, 6);
++			memcpy(d + 6, lo ? wl_bss.bssid : wl_mac, 6);
++			lo = memcmp(snonce, anonce, 32) < 0;
++			memcpy(d + 12, lo ? snonce : anonce, 32);
++			memcpy(d + 44, lo ? anonce : snonce, 32);
++			wl_prf(pmk, 32, "Pairwise key expansion", d, 76, ptk, 48);
++			have_ptk = true;
++			uint32_t rl = EK_DATA + sizeof(wl_rsn);
++			bzero(r, rl);
++			r[0] = 1;
++			r[1] = 3;
++			r[2] = (uint8_t)((rl - 4) >> 8);
++			r[3] = (uint8_t)(rl - 4);
++			r[4] = 2;                               /* RSN key descriptor */
++			r[EK_INFO] = 0x01;                      /* MIC | pairwise | HMAC-SHA1/AES */
++			r[EK_INFO + 1] = 0x0a;
++			memcpy(r + EK_REPLAY, e + EK_REPLAY, 8);
++			memcpy(r + EK_NONCE, snonce, 32);
++			r[EK_DATA - 1] = sizeof(wl_rsn);
++			memcpy(r + EK_DATA, wl_rsn, sizeof(wl_rsn));
++			uint8_t mic[20];
++			wl_hmac_sha1(ptk, 16, r, rl, NULL, 0, mic);
++			memcpy(r + EK_MIC, mic, 16);
++			bool sent = wl_data_tx(wl_bss.bssid, 0x888e, r, rl);
++			printf("NATRIUM WLAN: EAPOL 1/4 (info %#x) -> 2/4 %s\n", info, sent ? "sent" : "SEND FAILED");
++		} else if ((info & 0x1c8u) == 0x1c8u && have_ptk) {   /* msg 3: pairwise, install, ack, MIC */
++			uint8_t mic[20], got[16];
++			memcpy(got, e + EK_MIC, 16);
++			bzero(e + EK_MIC, 16);
++			wl_hmac_sha1(ptk, 16, e, elen, NULL, 0, mic);
++			if (memcmp(mic, got, 16) != 0 || memcmp(e + EK_NONCE, anonce, 32) != 0) {
++				printf("NATRIUM WLAN: EAPOL 3/4: MIC or ANonce mismatch (wrong passphrase?)\n");
++				continue;
++			}
++			bool gtk_ok = false;
++			if ((info & 0x1000u) && dlen <= sizeof(kd) + 8 && wl_unwrap(ptk + 16, e + EK_DATA, dlen, kd)) {
++				for (uint32_t o = 0; o + 2 <= dlen - 8 && o + 2 + kd[o + 1] <= dlen - 8; o += 2u + kd[o + 1]) {
++					if (kd[o] == 0xdd && kd[o + 1] == 6 + 16 && kd[o + 2] == 0 && kd[o + 3] == 0x0f && kd[o + 4] == 0xac &&
++					    kd[o + 5] == 1) {
++						gtk_id = kd[o + 6] & 3;
++						memcpy(gtk, kd + o + 8, 16);
++						gtk_ok = true;
++					}
++				}
++			}
++			memcpy(rsc, e + EK_RSC, 8);
++			uint32_t rl = EK_DATA;
++			bzero(r, rl);
++			r[0] = 1;
++			r[1] = 3;
++			r[3] = EK_DATA - 4;
++			r[4] = 2;
++			r[EK_INFO] = 0x03;                      /* secure | MIC | pairwise | v2 */
++			r[EK_INFO + 1] = 0x0a;
++			memcpy(r + EK_REPLAY, e + EK_REPLAY, 8);
++			wl_hmac_sha1(ptk, 16, r, rl, NULL, 0, mic);
++			memcpy(r + EK_MIC, mic, 16);
++			bool sent = wl_data_tx(wl_bss.bssid, 0x888e, r, rl) && wl_tx_wait(1000);
++			printf("NATRIUM WLAN: EAPOL 3/4 (info %#x, GTK %s id %u) -> 4/4 %s (tx status %u)\n", info, gtk_ok ? "ok" : "MISSING",
++			    gtk_id, sent ? "sent" : "SEND FAILED", wl_txc_status);
++			done = gtk_ok && wl_install_key(0, 0, ptk + 32, NULL) && wl_install_key(gtk_id, 1, gtk, rsc);
++			if (!done) {
++				break;
++			}
++		} else {
++			printf("NATRIUM WLAN: EAPOL key info %#x ignored\n", info);
++		}
++	}
++	bzero(pmk, sizeof(pmk));
++	bzero(ptk, sizeof(ptk));
++	bzero(gtk, sizeof(gtk));
++	return done;
++}
++
++/* DHCP DISCOVER (broadcast) and wait for an OFFER: proves encrypted tx and rx. */
++static bool
++wl_dhcp(void)
++{
++	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++	static uint8_t ip[328];
++	uint8_t *u = ip + 20, *d = u + 8, xid[4];
++	read_random(xid, 4);
++	bzero(ip, sizeof(ip));
++	ip[0] = 0x45;
++	ip[2] = sizeof(ip) >> 8;
++	ip[3] = sizeof(ip) & 0xff;
++	ip[8] = 64;
++	ip[9] = 17;
++	memset(ip + 16, 0xff, 4);
++	uint32_t sum = 0;
++	for (int i = 0; i < 20; i += 2) {
++		sum += (uint32_t)(ip[i] << 8 | ip[i + 1]);
++	}
++	sum = (sum & 0xffff) + (sum >> 16);
++	sum = ~(sum + (sum >> 16)) & 0xffff;
++	ip[10] = (uint8_t)(sum >> 8);
++	ip[11] = (uint8_t)sum;
++	u[1] = 68;
++	u[3] = 67;
++	u[4] = (sizeof(ip) - 20) >> 8;
++	u[5] = (sizeof(ip) - 20) & 0xff;
++	d[0] = 1;                                       /* BOOTREQUEST, ethernet */
++	d[1] = 1;
++	d[2] = 6;
++	memcpy(d + 4, xid, 4);
++	d[10] = 0x80;                                   /* broadcast reply */
++	memcpy(d + 28, wl_mac, 6);
++	static const uint8_t opt[] = { 0x63, 0x82, 0x53, 0x63, 53, 1, 1, 55, 3, 1, 3, 6, 255 };
++	memcpy(d + 236, opt, sizeof(opt));
++	for (int tries = 0; tries < 3; tries++) {
++		wl_ip_len = 0;
++		if (!wl_data_tx(bcast, 0x0800, ip, sizeof(ip))) {
++			return false;
++		}
++		bool txok = wl_tx_wait(500);
++		printf("NATRIUM WLAN: DHCP DISCOVER sent (tx %s, status %u)\n", txok ? "done" : "no completion", wl_txc_status);
++		for (uint64_t end = wl_ms() + 3000; wl_ms() < end;) {
++			(void)wl_htc_poll(10);
++			if (wl_ip_len < 28 + 240 || wl_ip[9] != 17) {
++				continue;
++			}
++			const uint8_t *ru = wl_ip + (wl_ip[0] & 15) * 4, *rd = ru + 8;
++			wl_ip_len = 0;
++			if (ru[3] != 68 || rd[0] != 2 || memcmp(rd + 4, xid, 4) != 0) {
++				continue;
++			}
++			printf("NATRIUM WLAN: DHCP OFFER: %u.%u.%u.%u from %u.%u.%u.%u\n", rd[16], rd[17], rd[18], rd[19],
++			    wl_ip[12], wl_ip[13], wl_ip[14], wl_ip[15]);
++			return true;
++		}
++	}
++	printf("NATRIUM WLAN: no DHCP OFFER (%u MSDUs received)\n", wl_htt_rx);
++	return false;
++}
++
++static bool
++wl_connect(void)
++{
++	if (!wl_crypto_selftest()) {
++		return false;
++	}
++	if (!wl_bss.found) {
++		printf("NATRIUM WLAN: \"%s\" not found by the scan\n", wl_ssid);
++		return false;
++	}
++	uint32_t ch = wl_bss.ch, freq = ch <= 14 ? 2407 + 5 * ch : 5000 + 5 * ch, nr;
++	bool g = ch <= 14;
++	printf("NATRIUM WLAN: joining \"%s\": ch %u (%u MHz) snr %u cap %#x\n", wl_ssid, ch, freq, wl_bss.snr, wl_bss.cap);
++	if (!wl_rsn_check()) {
++		printf("NATRIUM WLAN: unsupported security (need WPA2-PSK with CCMP)\n");
++		return false;
++	}
++	wl_step("connect");
++	uint32_t ps[2] = { 0, 0 };                      /* vdev 0: power save off */
++	if (!wl_wmi_simple(WMI_STA_PS_MODE_CMDID, TAG_STA_PS_MODE, ps, 2)) {
++		return false;
++	}
++	uint32_t *w = wl_wmi_begin(WMI_VDEV_START_CMDID, TAG_VDEV_START, 72);
++	w[2] = 100;                                     /* beacon interval, DTIM 1 */
++	w[3] = 1;
++	w = wl_tlv(w + 18, TAG_CHANNEL, 24);
++	w[0] = freq;
++	w[1] = freq;
++	w[3] = g ? 1u : 0u;                             /* MODE_11G / MODE_11A */
++	w[4] = 40u << 8 | 40u << 16;
++	w[5] = 40u << 8;
++	w = wl_tlv(w + 6, TAG_ARRAY_STRUC, 0);
++	if (!wl_wmi_send(w) || !wl_wmi_event(WMI_VDEV_START_RESP_EVTID, 2000)) {
++		printf("NATRIUM WLAN: vdev start: no response\n");
++		return false;
++	}
++	printf("NATRIUM WLAN: vdev start: status %u\n", le32(&wl_msg[8 + 12]));
++	uint32_t pc[4] = { 0, 0, 0, 0 };
++	wl_put_mac(&pc[1], wl_bss.bssid);
++	if (!wl_wmi_simple(WMI_PEER_CREATE_CMDID, TAG_PEER_CREATE, pc, 4)) {
++		return false;
++	}
++	for (int i = 0; i < 20; i++) {
++		(void)wl_htc_poll(10);                  /* HTT PEER_MAP */
++	}
++
++	wl_step("auth");
++	static uint8_t f[256];
++	const uint8_t *rsp = NULL;
++	uint32_t n = wl_hdr(f, 0xb0, 0, wl_bss.bssid), rl = 0;
++	bzero(f + n, 6);
++	f[n + 2] = 1;                                   /* open system, seq 1 */
++	n += 6;
++	for (int i = 0; i < 3 && !rsp; i++) {
++		if (!wl_htt_tx(f, n, true)) {
++			return false;
++		}
++		rsp = wl_wait_mgmt(0xb0, 500, &rl);
++	}
++	uint32_t st = rsp && rl >= 30 ? (rsp[28] | rsp[29] << 8) : 0xffff;
++	printf("NATRIUM WLAN: auth: %s status %u (tx completion id %d status %u)\n", rsp ? "response" : "NO RESPONSE", st, wl_txc_id,
++	    wl_txc_status);
++	if (st) {
++		return false;
++	}
++
++	wl_step("assoc");
++	static const uint8_t rates_g[12] = { 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c };
++	static const uint8_t rates_a[8] = { 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c };
++	const uint8_t *rates = g ? rates_g : rates_a;
++	nr = g ? 12 : 8;
++	n = wl_hdr(f, 0x00, 0, wl_bss.bssid);
++	uint32_t cap = 0x0011u | (g ? (wl_bss.cap & 0x0420u) : 0);     /* ESS, privacy (+ short preamble / slot) */
++	f[n++] = cap & 0xff;
++	f[n++] = (uint8_t)(cap >> 8);
++	f[n++] = 10;                                    /* listen interval */
++	f[n++] = 0;
++	f[n++] = 0;
++	f[n++] = (uint8_t)strlen(wl_ssid);
++	memcpy(f + n, wl_ssid, strlen(wl_ssid));
++	n += strlen(wl_ssid);
++	f[n++] = 1;
++	f[n++] = 8;
++	memcpy(f + n, rates, 8);
++	n += 8;
++	if (g) {
++		f[n++] = 50;                            /* extended supported rates */
++		f[n++] = 4;
++		memcpy(f + n, rates_g + 8, 4);
++		n += 4;
++	}
++	memcpy(f + n, wl_rsn, sizeof(wl_rsn));
++	n += sizeof(wl_rsn);
++	rsp = NULL;
++	for (int i = 0; i < 3 && !rsp; i++) {
++		if (!wl_htt_tx(f, n, true)) {
++			return false;
++		}
++		rsp = wl_wait_mgmt(0x10, 500, &rl);
++	}
++	st = rsp && rl >= 30 ? (rsp[26] | rsp[27] << 8) : 0xffff;
++	uint32_t aid = rsp && rl >= 30 ? (rsp[28] | rsp[29] << 8) & 0x3fffu : 0;
++	printf("NATRIUM WLAN: assoc: %s status %u aid %u\n", rsp ? "response" : "NO RESPONSE", st, aid);
++	if (st) {
++		return false;
++	}
++	w = wl_wmi_begin(WMI_PEER_ASSOC_CMDID, TAG_PEER_ASSOC, 76);
++	wl_put_mac(w, wl_bss.bssid);
++	w[3] = 1;                                       /* new assoc */
++	w[4] = aid;
++	w[5] = 0x1u | 0x4u;                             /* AUTH, NEED_PTK_4_WAY */
++	w[6] = wl_bss.cap;
++	w[7] = 10;
++	w[12] = 1;                                      /* nss */
++	w[14] = g ? 1u : 0u;                            /* MODE_11G / MODE_11A */
++	w[17] = nr;
++	w = wl_tlv(w + 19, TAG_ARRAY_BYTE, (nr + 3) & ~3u);
++	memcpy(w, rates, nr);
++	w = wl_tlv(w + (nr + 3) / 4, TAG_ARRAY_BYTE, 0);
++	w = wl_tlv(w, TAG_VHT_RATE_SET, 16);
++	if (!wl_wmi_send(w + 4)) {
++		return false;
++	}
++	uint32_t up[4] = { 0, aid, 0, 0 };
++	wl_put_mac(&up[2], wl_bss.bssid);
++	if (!wl_wmi_simple(WMI_VDEV_UP_CMDID, TAG_VDEV_UP, up, 4)) {
++		return false;
++	}
++
++	wl_step("4-way handshake");
++	if (!wl_4way()) {
++		printf("NATRIUM WLAN: 4-way handshake FAILED (%u MSDUs received)\n", wl_htt_rx);
++		return false;
++	}
++	uint32_t auth[5] = { 0, 0, 0, 3, 1 };           /* peer param AUTHORIZE = 1 */
++	wl_put_mac(&auth[1], wl_bss.bssid);
++	if (!wl_wmi_simple(WMI_PEER_SET_PARAM_CMDID, TAG_PEER_SET_PARAM, auth, 5)) {
++		return false;
++	}
++	printf("NATRIUM WLAN: CONNECTED to \"%s\" (WPA2-PSK, CCMP)\n", wl_ssid);
++	sweet_log_kick();
++	wl_step("dhcp");
++	(void)wl_dhcp();
++	return true;
++}
++
++static void
+ wl_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+ 	wl_msleep(20000);       /* after boot: the log thread runs, iOS is up */
+@@ -1961,6 +2752,10 @@
+ 			if (ok) {
+ 				ok = wl_scan();
+ 				printf("NATRIUM WLAN: scan %s\n", ok ? "found networks" : "FAILED");
++				if (ok && wl_ssid[0]) {
++					ok = wl_connect();
++					printf("NATRIUM WLAN: stage 4 %s\n", ok ? "done: connected" : "FAILED");
++				}
+ 			}
+ 		}
+ 		sweet_log_kick();
+@@ -1974,6 +2769,8 @@
+ 	int on = 0;
+ 	thread_t thread;
+ 	(void)PE_parse_boot_argn("natriumwlan", &on, sizeof(on));
++	(void)PE_parse_boot_argn("natriumssid", wl_ssid, sizeof(wl_ssid));
++	(void)PE_parse_boot_argn("natriumpsk", wl_psk, sizeof(wl_psk));
+ 	if (!on) {
+ 		return;
+ 	}

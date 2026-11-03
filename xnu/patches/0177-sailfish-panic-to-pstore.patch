@@ -1,0 +1,65 @@
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -15,6 +15,7 @@
+ #if defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
++#include <mach/vm_param.h>
+ 
+ /* persistent_ram_buffer: "DBGC", start, size, then the text (no ECC) */
+ #define PRZ_OFF         (SWEET_EARLY_LOG_PRZ - SWEET_EARLY_LOG_BLOCK)
+@@ -133,19 +134,50 @@
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++static void
++sweet_panic_string(const char *s)
++{
++	while (*s) {
++		sweet_log_putc(*s++);
++	}
++}
++
++static void
++sweet_panic_hex(uint64_t v)
++{
++	sweet_panic_string(" 0x");
++	for (int sh = 60; sh >= 0; sh -= 4) {
++		sweet_log_putc("0123456789abcdef"[(v >> sh) & 0xf]);
++	}
++}
++
++/*
++ * Also after sweet_early_disable: with the console off (sweetfb_noconsole)
++ * nothing else reaches pstore, and a panic would look like a silent reset.
++ * Message, kernel slide and the frame-pointer chain (unslid: symbolize
++ * against kernel.development.sweet).
++ */
+ void
+ sweet_early_panic(const char *fmt, va_list *args)
+ {
+-	if (early_disabled || early_panicking) {
++	if (early_panicking) {
+ 		return;
+ 	}
+ 	early_panicking = 1;
+-	sweet_early_string("\nSWEET EARLY PANIC: ");
++	sweet_panic_string("\nSWEET PANIC: ");
+ 	va_list copy;
+ 	va_copy(copy, *args);
+-	_doprnt(fmt, &copy, sweet_early_putc, 16);
++	_doprnt(fmt, &copy, sweet_log_putc, 16);
+ 	va_end(copy);
+-	sweet_early_putc('\n');
++	sweet_panic_string("\nSWEET PANIC slide");
++	sweet_panic_hex(vm_kernel_slide);
++	sweet_panic_string("\nSWEET PANIC unslid bt");
++	uint64_t *fp = __builtin_frame_address(0);
++	for (int i = 0; i < 16 && fp && ((uintptr_t)fp & 7) == 0 && (uintptr_t)fp >= 0xfffffe0000000000ull; i++) {
++		sweet_panic_hex(fp[1] - vm_kernel_slide);
++		fp = (uint64_t *)fp[0];
++	}
++	sweet_log_putc('\n');
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 

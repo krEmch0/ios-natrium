@@ -1,0 +1,348 @@
+--- a/bsd/dev/natrium_wlan.c
++++ b/bsd/dev/natrium_wlan.c
+@@ -630,6 +630,11 @@
+ #define D_DIAG          0x2000u         /* 2 KB */
+ #define D_CE2_DST       0x0800u         /* 16 */
+ #define D_CE3_SRC       0x0900u         /* 16 */
++#define D_CE4_SRC       0x0a00u         /* 16 */
++#define D_HTT_RING      0x3000u         /* HTT rx ring: 256 buffer addresses */
++#define D_HTT_IDX       0x3400u         /* its alloc index (host -> firmware shadow) */
++#define D_HTT_BUF       0x200000u       /* 256 x 2 KB HTT rx buffers */
++#define HTT_RING_N      256u
+ #define D_RX1           0x10000u        /* 14 x 2 KB, CE 1 (HTC control, HTT) */
+ #define D_RX2           0x18000u        /* 14 x 2 KB, CE 2 (WMI events) */
+ #define D_TX            0x20000u        /* 2 KB per CE 0 / CE 3 send, synchronous */
+@@ -647,6 +652,7 @@
+ static struct wl_ce ce7 = { Q_CE(7), D_CE7_SRC, D_CE7_DST, 1 };
+ static struct wl_ce ce2 = { Q_CE(2), 0, D_CE2_DST, 15 };
+ static struct wl_ce ce3 = { Q_CE(3), D_CE3_SRC, 0, 15 };
++static struct wl_ce ce4 = { Q_CE(4), D_CE4_SRC, 0, 15 };
+ 
+ static void
+ wl_ce_init(struct wl_ce *c, uint32_t dmax)
+@@ -1247,6 +1253,7 @@
+ 	wl_ce_init(&ce7, 2048);
+ 	wl_ce_init(&ce2, 2048);
+ 	wl_ce_init(&ce3, 2048);
++	wl_ce_init(&ce4, 256);
+ 	if (!wl_early_config(chip)) {
+ 		return false;
+ 	}
+@@ -1422,13 +1429,14 @@
+ #define TAG_HOST_MEM_REQ        0x22u
+ #define TAG_READY               0x23u
+ 
+-static uint8_t wl_wmi_ep = 0xff, wl_seq[8];
++static uint8_t wl_wmi_ep = 0xff, wl_htt_ep = 0xff, wl_seq[8], wl_mac[6];
++static uint32_t wl_htt_alloc, wl_htt_rx;       /* HTT rx ring: host write index, MSDUs indicated */
+ 
+ /* Send an HTC frame (payload already at D_TX + 8 + CE slot) on eid through CE c. */
+ static bool
+ wl_htc_send(struct wl_ce *c, uint8_t eid, uint32_t len)
+ {
+-	uint32_t off = D_TX + (c == &ce3 ? 0x800u : 0);
++	uint32_t off = D_TX + (c == &ce3 ? 0x800u : c == &ce4 ? 0x1000u : 0);
+ 	volatile uint8_t *h = (volatile uint8_t *)(wl_dma + off);
+ 	if (eid == wl_wmi_ep) {
+ 		for (int i = 0; i < 2000 && !wl_credits; i++) {
+@@ -1460,7 +1468,7 @@
+ static uint8_t *
+ wl_htc_tx_payload(struct wl_ce *c)
+ {
+-	return (uint8_t *)(wl_dma + D_TX + (c == &ce3 ? 0x800u : 0) + 8);
++	return (uint8_t *)(wl_dma + D_TX + (c == &ce3 ? 0x800u : c == &ce4 ? 0x1000u : 0) + 8);
+ }
+ 
+ /* Last received WMI event / HTC control message (copied out of the rx buffer). */
+@@ -1502,6 +1510,20 @@
+ 				}
+ 				r += 4 + rl;
+ 			}
++			if (eid == wl_htt_ep && len - tl >= 48 && f[8] == 1) {
++				/*
++				 * HTT RX_IND: the firmware filled ring buffers. Sum the MPDU ranges
++				 * (one buffer per MPDU here) and hand the slots back: slot i always
++				 * holds buffer i, so advancing the alloc index recycles them.
++				 */
++				uint32_t nr = f[8 + 7], fwd = f[8 + 44] | (uint32_t)f[8 + 45] << 8, ro = 8 + 48 + ((fwd + 3) & ~3u), cnt = 0;
++				for (uint32_t i = 0; i < nr && ro + 4 * i + 4 <= 8 + len; i++) {
++					cnt += f[ro + 4 * i];
++				}
++				wl_htt_rx += cnt;
++				wl_htt_alloc = (wl_htt_alloc + cnt) & (HTT_RING_N - 1);
++				*(volatile uint32_t *)(wl_dma + D_HTT_IDX) = wl_htt_alloc;
++			}
+ 			wl_msg_len = len - tl;
+ 			wl_msg_eid = eid;
+ 			for (uint32_t i = 0; i < wl_msg_len && i < sizeof(wl_msg); i++) {
+@@ -1572,6 +1594,60 @@
+ {
+ 	*w = tag << 16 | len;
+ 	return w + 1;
++}
++
++/*
++ * ath10k_htt_setup: version handshake, then one rx ring (ath10k
++ * send_rx_ring_cfg_32: 2 KB buffers, all frame types, offsets of
++ * htt_rx_desc_v1 in words: attention 1, frag 2, mpdu start 3, msdu start 6,
++ * msdu end 10, mpdu end 20, ppdu start 21, ppdu end 31, header 59,
++ * payload 75). The firmware's receive path needs it.
++ */
++static bool
++wl_htt_setup(void)
++{
++	if (wl_htt_ep == 0xff) {
++		return false;
++	}
++	uint8_t *p = wl_htc_tx_payload(&ce4);
++	bzero(p, 4);                                    /* VERSION_REQ */
++	if (!wl_htc_send(&ce4, wl_htt_ep, 4)) {
++		return false;
++	}
++	bool ver = false;
++	for (int i = 0; i < 100 && !ver; i++) {
++		ver = wl_htc_poll(10) == wl_htt_ep && wl_msg[0] == 0;
++	}
++	printf("NATRIUM WLAN: HTT version %u.%u%s\n", wl_msg[2], wl_msg[1], ver ? "" : " (NO REPLY)");
++	if (!ver) {
++		return false;
++	}
++	volatile uint32_t *ring = (volatile uint32_t *)(wl_dma + D_HTT_RING);
++	for (uint32_t i = 0; i < HTT_RING_N; i++) {
++		ring[i] = WL_DMA_PA + D_HTT_BUF + 2048 * i;
++	}
++	wl_htt_alloc = HTT_RING_N - 1;
++	*(volatile uint32_t *)(wl_dma + D_HTT_IDX) = wl_htt_alloc;
++	static const uint16_t offs[10] = { 59, 75, 21, 31, 3, 20, 6, 10, 1, 2 };
++	bzero(p, 40);
++	p[0] = 2;                                       /* RX_RING_CFG */
++	p[1] = 1;                                       /* one ring */
++	uint32_t *q = (uint32_t *)(p + 4);
++	q[0] = WL_DMA_PA + D_HTT_IDX;                   /* fw_idx_shadow_reg_paddr */
++	q[1] = WL_DMA_PA + D_HTT_RING;
++	uint16_t *h = (uint16_t *)(p + 12);
++	h[0] = HTT_RING_N;
++	h[1] = 2048;
++	h[2] = 0xffff;                                  /* all HTT_RX_RING_FLAGS_ */
++	h[3] = (uint16_t)wl_htt_alloc;
++	for (int i = 0; i < 10; i++) {
++		h[4 + i] = offs[i];
++	}
++	if (!wl_htc_send(&ce4, wl_htt_ep, 40)) {
++		return false;
++	}
++	printf("NATRIUM WLAN: HTT rx ring: %u x 2 KB at %#x\n", HTT_RING_N, WL_DMA_PA + D_HTT_BUF);
++	return true;
+ }
+ 
+ static bool
+@@ -1580,6 +1656,7 @@
+ 	wl_step("htc");
+ 	printf("NATRIUM WLAN: HTC: %u credits of %u bytes\n", wl_credits, wl_credit_size);
+ 	uint8_t tx_alloc = (uint8_t)wl_credits;
++	wl_htt_ep = wl_htc_connect(0x300, 0);           /* HTT data first, as ath10k */
+ 	wl_wmi_ep = wl_htc_connect(0x100, tx_alloc);   /* WMI control */
+ 	if (wl_wmi_ep == 0xff) {
+ 		return false;
+@@ -1609,6 +1686,10 @@
+ 			}
+ 			printf("NATRIUM WLAN: service ready: fw build %#x abi %#x/%u phy cap %#x rf chains %u ht %#x vht %#x mem reqs %u max scan chans %u\n",
+ 			    le32(v), abi[0], abi[1], le32(v + 28), le32(v + 36), le32(v + 40), le32(v + 44), le32(v + 72), le32(v + 76));
++		} else if (tag == 0x21u && len >= 36) {        /* HAL_REG_CAPABILITIES */
++			printf("NATRIUM WLAN: reg caps: eeprom rd %#x ext %#x regcap %#x/%#x modes %#x 2g %u-%u 5g %u-%u\n",
++			    le32(v), le32(v + 4), le32(v + 8), le32(v + 12), le32(v + 16), le32(v + 20), le32(v + 24), le32(v + 28),
++			    le32(v + 32));
+ 		} else if (tag == TAG_ARRAY_STRUC) {
+ 			for (uint32_t a = 0; a + 4 <= len;) {
+ 				uint32_t eh = le32(v + a), et = eh >> 16, el = eh & 0xffff;
+@@ -1691,7 +1772,178 @@
+ 	const uint8_t *r = &wl_msg[4 + 4 + 24];        /* WMI hdr, TLV hdr, ABI: then mac addr */
+ 	printf("NATRIUM WLAN: WMI READY: MAC %02x:%02x:%02x:%02x:%02x:%02x status %u\n",
+ 	    r[0], r[1], r[2], r[3], r[4], r[5], le32(r + 8));
+-	return true;
++	memcpy(wl_mac, r, 6);
++	return wl_htt_setup();
++}
++
++/*
++ * Stage 3b: a passive scan (ath10k: update_channel_list, vdev create,
++ * hw_scan defaults). Beacons and probe responses arrive as WMI MGMT_RX
++ * events: header TLV, then the 802.11 frame as a byte array.
++ */
++#define WMI_START_SCAN_CMDID    0x3001u
++#define WMI_SCAN_CHAN_LIST_CMDID 0x3003u
++#define WMI_VDEV_CREATE_CMDID   0x5001u
++#define WMI_SCAN_EVTID          0x3001u
++#define WMI_MGMT_RX_EVTID       0x7001u
++#define TAG_ARRAY_UINT32        0x10u
++#define TAG_ARRAY_BYTE          0x11u
++#define TAG_ARRAY_FIXED_STRUC   0x13u
++#define TAG_START_SCAN          0x4du
++#define TAG_SCAN_CHAN_LIST      0x4fu
++#define TAG_CHANNEL             0x50u
++#define TAG_VDEV_CREATE         0x56u
++
++static bool
++wl_wmi_send(uint32_t *end)
++{
++	uint8_t *p = wl_htc_tx_payload(&ce3);
++	return wl_htc_send(&ce3, wl_wmi_ep, (uint32_t)((uint8_t *)end - p));
++}
++
++static uint32_t
++wl_freq(unsigned i)             /* scan channels: 2.4 GHz 1-13, 5 GHz 36-48 */
++{
++	return i < 13 ? 2412 + 5 * i : 5180 + 20 * (i - 13);
++}
++#define WL_NCHAN 17u
++
++static bool
++wl_scan(void)
++{
++	wl_step("scan setup");
++	uint32_t *w0 = (uint32_t *)wl_htc_tx_payload(&ce3), *w = w0;
++	*w++ = WMI_SCAN_CHAN_LIST_CMDID;
++	w = wl_tlv(w, TAG_SCAN_CHAN_LIST, 4);
++	*w++ = WL_NCHAN;
++	w = wl_tlv(w, TAG_ARRAY_STRUC, WL_NCHAN * 28);
++	for (unsigned i = 0; i < WL_NCHAN; i++) {
++		uint32_t f = wl_freq(i);
++		w = wl_tlv(w, TAG_CHANNEL, 24);
++		*w++ = f;
++		*w++ = f;                               /* band_center_freq1 */
++		*w++ = 0;
++		*w++ = f < 3000 ? 1u : (0u | 1u << 7);  /* mode 11G / 11A + PASSIVE */
++		*w++ = 40u << 8 | 40u << 16;            /* min 0, max 20 dBm, reg 20 dBm (0.5 dB units) */
++		*w++ = 40u << 8;                        /* max tx power */
++	}
++	if (!wl_wmi_send(w)) {
++		return false;
++	}
++	w = w0;
++	*w++ = WMI_VDEV_CREATE_CMDID;
++	w = wl_tlv(w, TAG_VDEV_CREATE, 20);
++	*w++ = 0;                                       /* vdev 0 */
++	*w++ = 2;                                       /* STA */
++	*w++ = 0;
++	*w++ = wl_mac[0] | wl_mac[1] << 8 | wl_mac[2] << 16 | (uint32_t)wl_mac[3] << 24;
++	*w++ = wl_mac[4] | wl_mac[5] << 8;
++	if (!wl_wmi_send(w)) {
++		return false;
++	}
++
++	wl_step("scan");
++	w = w0;
++	*w++ = WMI_START_SCAN_CMDID;
++	w = wl_tlv(w, TAG_START_SCAN, 25 * 4);
++	static const uint32_t common[15] = {
++		0xa001, 0xa001, 0, 1,                   /* scan id, requestor, vdev, priority low */
++		0x11f,                                  /* events: started, completed, bss/foreign chan, dequeued, exit */
++		50, 150, 50, 500, 0, 0, 0, 20000, 5,    /* dwell active/passive, rest min/max, ..., max time, probe delay */
++		0x1u | 0x10u | 0x20u,                   /* PASSIVE, CHAN_STAT_EVENT, FILTER_PROBE_REQ (inverted in WMI-TLV) */
++	};
++	for (int i = 0; i < 15; i++) {
++		*w++ = common[i];
++	}
++	*w++ = 0;                                       /* burst duration */
++	*w++ = WL_NCHAN;
++	*w++ = 1;                                       /* bssids: broadcast */
++	*w++ = 0;                                       /* ssids */
++	*w++ = 0;                                       /* ie len */
++	*w++ = 3;                                       /* probes */
++	*w++ = 0; *w++ = 0; *w++ = 0; *w++ = 0;         /* mac addr, mask */
++	w = wl_tlv(w, TAG_ARRAY_UINT32, WL_NCHAN * 4);
++	for (unsigned i = 0; i < WL_NCHAN; i++) {
++		*w++ = wl_freq(i);
++	}
++	w = wl_tlv(w, TAG_ARRAY_FIXED_STRUC, 0);
++	w = wl_tlv(w, TAG_ARRAY_FIXED_STRUC, 8);
++	*w++ = 0xffffffffu;
++	*w++ = 0xffffu;
++	w = wl_tlv(w, TAG_ARRAY_BYTE, 0);
++	if (!wl_wmi_send(w)) {
++		return false;
++	}
++
++	/* Collect beacons until the scan completes (or 20 s). */
++	static uint8_t seen[32][6];
++	static uint32_t hist_id[16], hist_n[16];
++	unsigned nseen = 0, events = 0, nhist = 0, mgmt = 0;
++	bool done = false;
++	for (int t = 0; t < 2000 && !done; t++) {
++		if (wl_htc_poll(10) != wl_wmi_ep || wl_msg_len < 8) {
++			continue;
++		}
++		uint32_t ev = le32(wl_msg) & 0xffffffu;
++		unsigned hi = 0;
++		while (hi < nhist && hist_id[hi] != ev) {
++			hi++;
++		}
++		if (hi == nhist && nhist < 16) {
++			hist_id[nhist++] = ev;
++			printf("NATRIUM WLAN: first event %#x (%u bytes): %08x %08x %08x %08x %08x %08x %08x %08x\n", ev, wl_msg_len,
++			    le32(&wl_msg[4]), le32(&wl_msg[8]), le32(&wl_msg[12]), le32(&wl_msg[16]), le32(&wl_msg[20]),
++			    le32(&wl_msg[24]), le32(&wl_msg[28]), le32(&wl_msg[32]));
++		}
++		if (hi < 16) {
++			hist_n[hi]++;
++		}
++		if (ev == WMI_SCAN_EVTID) {
++			uint32_t e = le32(&wl_msg[8]), reason = le32(&wl_msg[12]), f = le32(&wl_msg[16]);
++			if (events++ < 4 || e == 2) {
++				printf("NATRIUM WLAN: scan event %#x reason %u freq %u\n", e, reason, f);
++			}
++			done = e == 2;                  /* COMPLETED */
++		} else if (ev == WMI_MGMT_RX_EVTID) {
++			mgmt++;
++			uint32_t hl = le32(&wl_msg[4]) & 0xffff, snr = le32(&wl_msg[12]), ch = le32(&wl_msg[8]);
++			uint32_t fo = 8 + hl + 4;               /* after the header TLV and the byte array's TLV header */
++			if (fo + 36 > wl_msg_len) {
++				continue;
++			}
++			const uint8_t *fr = &wl_msg[fo], *bssid = fr + 16;
++			uint32_t flen = (le32(&wl_msg[fo - 4]) & 0xffff);
++			if ((fr[0] != 0x80 && fr[0] != 0x50) || fo + flen > wl_msg_len) {
++				continue;                       /* beacons and probe responses only */
++			}
++			bool dup = false;
++			for (unsigned i = 0; i < nseen && !dup; i++) {
++				dup = memcmp(seen[i], bssid, 6) == 0;
++			}
++			if (dup || nseen >= 32) {
++				continue;
++			}
++			memcpy(seen[nseen++], bssid, 6);
++			char ssid[33] = "";
++			for (uint32_t o = 36; o + 2 <= flen; o += 2 + fr[o + 1]) {
++				if (fr[o] == 0 && fr[o + 1] <= 32 && o + 2 + fr[o + 1] <= flen) {
++					for (int i = 0; i < fr[o + 1]; i++) {
++						ssid[i] = (fr[o + 2 + i] >= 0x20 && fr[o + 2 + i] < 0x7f) ? (char)fr[o + 2 + i] : '?';
++					}
++					ssid[fr[o + 1]] = 0;
++					break;
++				}
++			}
++			printf("NATRIUM WLAN: BSS %02x:%02x:%02x:%02x:%02x:%02x ch %u snr %u \"%s\"\n", bssid[0], bssid[1],
++			    bssid[2], bssid[3], bssid[4], bssid[5], ch, snr, ssid);
++		}
++	}
++	printf("NATRIUM WLAN: scan %s: %u networks, %u mgmt rx events, %u HTT rx MSDUs\n", done ? "complete" : "TIMEOUT", nseen, mgmt, wl_htt_rx);
++	for (unsigned i = 0; i < nhist; i++) {
++		printf("NATRIUM WLAN: event %#x x %u\n", hist_id[i], hist_n[i]);
++	}
++	sweet_log_kick();
++	return nseen > 0;
+ }
+ 
+ static void
+@@ -1706,6 +1958,10 @@
+ 		if (ok) {
+ 			ok = wl_stage3();
+ 			printf("NATRIUM WLAN: stage 3 %s\n", ok ? "done: WMI ready" : "FAILED");
++			if (ok) {
++				ok = wl_scan();
++				printf("NATRIUM WLAN: scan %s\n", ok ? "found networks" : "FAILED");
++			}
+ 		}
+ 		sweet_log_kick();
+ 	}

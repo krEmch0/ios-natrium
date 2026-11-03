@@ -1,0 +1,399 @@
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -76,9 +76,85 @@
+ 	}
+ 
+ 	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
++}
++
++#if defined(SWEET)
++/*
++ * Device interrupts (GIC SPIs, INTIDs 32..1019) for SWEET drivers, after
++ * HackiOS's gic_v3_spi_attach() (github.com/oosexgang/hackios-xnu-kernel,
++ * osfmk/arm64/gic_v3_irq.c, APSL 2.0): configured (edge/level), routed to
++ * the processor that attaches it, enabled; its handler runs in interrupt
++ * context (sleh_irq -> sweet_spi_dispatch) and must quiet the device
++ * before returning (the interrupt is ended after it).
++ */
++#define GICD_ISENABLER(n)       (0x0100 + 4 * (n))
++#define GICD_ICENABLER(n)       (0x0180 + 4 * (n))
++#define GICD_IPRIORITYR(n)      (0x0400 + (n))
++#define GICD_ICFGR(n)           (0x0C00 + 4 * (n))
++#define GICD_IROUTER(n)         (0x6000 + 8 * (n))
++#define SWEET_SPI_MAX           1020
++
++static struct {
++	void (*fn)(void *arg);
++	void *arg;
++} sweet_spi[SWEET_SPI_MAX];
++
++static void
++sweet_gicd_rwp(void)
++{
++	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++}
++
++bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
++void sweet_spi_mask(uint32_t intid, bool masked);
++bool sweet_spi_dispatch(uint32_t intid);
++
++bool
++sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg)
++{
++	if (intid < 32 || intid >= SWEET_SPI_MAX || fn == NULL || gicd_base == 0) {
++		return false;
++	}
++	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1") & 0xFF00FFFFFFULL;   /* Aff3, Aff2.1.0 */
++	gicd_write32(GICD_ICENABLER(intid / 32), 1u << (intid % 32));
++	sweet_gicd_rwp();
++	sweet_spi[intid].arg = arg;
++	sweet_spi[intid].fn = fn;
++	__builtin_arm_dmb(DMB_ISH);
++	uint32_t cfg = gicd_read32(GICD_ICFGR(intid / 16)), bit = 2u << (2 * (intid % 16));
++	gicd_write32(GICD_ICFGR(intid / 16), edge ? (cfg | bit) : (cfg & ~bit));
++	*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(intid)) = 0xA0;
++	*(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid)) = mpidr;
++	gicd_write32(GICD_ISENABLER(intid / 32), 1u << (intid % 32));
++	sweet_gicd_rwp();
++	kprintf("SWEET GIC: SPI intid %u (%s) attached, routed to MPIDR 0x%llx\n", intid, edge ? "edge" : "level", mpidr);
++	return true;
+ }
+ 
++/* Masked: the line stays quiet at the GIC (a driver giving up on a storming interrupt). */
+ void
++sweet_spi_mask(uint32_t intid, bool masked)
++{
++	if (intid >= 32 && intid < SWEET_SPI_MAX && gicd_base) {
++		gicd_write32(masked ? GICD_ICENABLER(intid / 32) : GICD_ISENABLER(intid / 32), 1u << (intid % 32));
++	}
++}
++
++/* From sleh_irq: false if nobody attached the INTID. */
++bool
++sweet_spi_dispatch(uint32_t intid)
++{
++	if (intid >= SWEET_SPI_MAX || sweet_spi[intid].fn == NULL) {
++		return false;
++	}
++	sweet_spi[intid].fn(sweet_spi[intid].arg);
++	return true;
++}
++#endif /* SWEET */
++
++void
+ pe_init_fiq()
+ {
+ 	int error;
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1939,6 +1939,10 @@
+ 		fp = ((uint64_t *)fp)[0];
+ 	}
+ }
++#endif
++
++#if defined(SWEET)
++extern bool sweet_spi_dispatch(uint32_t intid);
+ #endif
+ 
+ void
+@@ -1982,7 +1986,9 @@
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+-		if (cdp->interrupt_handler) {
++		if (sweet_spi_dispatch(intid)) {
++			/* a SWEET driver's device interrupt (pexpert/arm/pe_fiq.c) */
++		} else if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
+ 			    cdp->interrupt_nub,
+--- a/bsd/dev/natrium_wlan.c
++++ b/bsd/dev/natrium_wlan.c
+@@ -22,6 +22,7 @@
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+@@ -1989,6 +1990,8 @@
+ static volatile uint32_t wl_join_result;        /* ASSOCIATE_RESULT: 0 running, 1 joined, 21 wrong key, 2 failed */
+ static bool wl_use_pmk, wl_auth_fail;           /* the join's key is wl_pmk_given; its 4-way handshake got no msg 3 */
+ static uint8_t wl_pmk_given[32];
++static int wl_irq_chan;                         /* the Wi-Fi thread sleeps here between interrupts (wl_idle) */
++#define wl_kick()       thread_wakeup(&wl_irq_chan)     /* work for the thread: frames, wifid's requests */
+ 
+ /* 802.11 frame of the WMI MGMT_RX event in wl_msg (header TLV, then a byte array); NULL if malformed. */
+ static const uint8_t *
+@@ -2744,6 +2747,7 @@
+ 	}
+ 	wl_ifq[(wl_ifq_head + wl_ifq_count++) % WL_IFQ] = m;
+ 	lck_mtx_unlock(wl_ifq_lock);
++	wl_kick();
+ }
+ 
+ /*
+@@ -2847,6 +2851,7 @@
+ 		case A80211_SCAN_REQ_MULTI:
+ 			err = wl_ready && wl_power ? 0 : EBUSY; /* EBUSY: the framework tries again */
+ 			wl_scan_req = !err;             /* wl_run scans, then posts SCAN_DONE */
++			wl_kick();
+ 			break;
+ 		case A80211_ASSOCIATE: {                /* {version, mode, auth, ssid len @12, ssid @16, bssid @48, key len @60, cipher @64, key @72} */
+ 			static uint8_t a[0x88];
+@@ -2874,6 +2879,7 @@
+ 				lck_mtx_unlock(wl_ifq_lock);
+ 				wl_join_result = 0;
+ 				err = 0;
++				wl_kick();
+ 			}
+ 			bzero(a, sizeof(a));
+ 			break;
+@@ -2882,6 +2888,7 @@
+ 			lck_mtx_lock(wl_ifq_lock);
+ 			wl_req.leave = true;
+ 			lck_mtx_unlock(wl_ifq_lock);
++			wl_kick();
+ 			err = 0;
+ 			break;
+ 		case A80211_POWER:                      /* {version, radios, state[4]} */
+@@ -2893,6 +2900,7 @@
+ 			wl_req.power_set = true;
+ 			wl_req.power_on = w[2] != 0;
+ 			lck_mtx_unlock(wl_ifq_lock);
++			wl_kick();
+ 			printf("NATRIUM 80211: power %s\n", w[2] ? "on" : "off");
+ 			err = 0;
+ 			break;
+@@ -3156,11 +3164,79 @@
+ }
+ 
+ /*
+- * The data path, polled (ponytail: 1 ms poll on this thread; the CE
+- * interrupts would let it sleep): queued Ethernet frames out as
+- * native-wifi data, received frames go in through wl_rx_msdu.
++ * Interrupts: the chip's legacy INTA, PCIe RC0 int_a = GIC SPI 244 = INTID
++ * 276, level (live DT qcom,pcie@600000 interrupt-map). As ath10k's legacy
++ * mode: copy-complete interrupts on the rx copy engines (CE HOST_IE bit 0,
++ * HOST_IS write-1-to-clear), the chip's PCIE_INTR_ENABLE (SoC core + 0x8:
++ * firmware + all CEs) gates INTA; the handler disables and clears it
++ * (CLR + 0x14) and wakes the thread, which services the rings and enables it
++ * again before sleeping. Boot-arg natriumirq=0, or no interrupt in the
++ * first 20 s: polling as before.
+  */
++#define WL_IRQ_INTID            276u
++#define Q_PCIE_INTR_ENABLE      (Q_SOC_CORE + 0x08u)
++#define Q_PCIE_INTR_CLR         (Q_SOC_CORE + 0x14u)
++#define WL_PCIE_INTR_MASK       (0x400u | 0x7f800u)     /* firmware, CE 0-7 */
++#define CE_HOST_IS              0x30u
++extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
++extern void sweet_spi_mask(uint32_t intid, bool masked);
++static volatile bool wl_irq_on;
++static volatile uint32_t wl_irqs;
++
+ static void
++wl_irq(__unused void *arg)
++{
++	static uint64_t window;
++	static uint32_t in_window;
++	uint64_t now = mach_absolute_time();
++	if (now - window > 19200000ull) {               /* 1 s of the 19.2 MHz timebase */
++		window = now;
++		in_window = 0;
++	}
++	/*
++	 * The link through the RC (never the chip's BAR over a dead link: that
++	 * hangs the bus); a line that will not go quiet (storm): masked, polling.
++	 */
++	if (++in_window > 20000 || !(rd(wl_dbi, ELBI_SYS_STTS) & XMLH_LINK_UP) || !(rd(wl_dbi, DBI_LINK_STATUS) & (1u << 29))) {
++		sweet_spi_mask(WL_IRQ_INTID, true);
++		wl_irq_on = false;
++		wl_kick();
++		return;
++	}
++	wr(wl_bar, Q_PCIE_INTR_ENABLE, 0);
++	wr(wl_bar, Q_PCIE_INTR_CLR, WL_PCIE_INTR_MASK);
++	(void)rd(wl_bar, Q_PCIE_INTR_ENABLE);           /* flush the writes before INTA is sampled again */
++	wl_irqs++;
++	wl_kick();
++}
++
++/* Nothing to do: clear the rx CEs' status, look once more, then sleep until INTA, a kick or 100 ms. */
++static void
++wl_idle(void)
++{
++	struct wl_ce *rx[2] = { &ce1, &ce2 };
++	for (int k = 0; k < 2; k++) {
++		wr(wl_bar, rx[k]->reg + CE_HOST_IS, 1u);
++		if (((volatile uint32_t *)(wl_dma + rx[k]->dst + 8 * rx[k]->drd))[1] & 0xffffu) {
++			return;                         /* arrived meanwhile */
++		}
++	}
++	(void)assert_wait_timeout((event_t)&wl_irq_chan, THREAD_UNINT, 100, NSEC_PER_MSEC);
++	if (wl_ifq_count || wl_scan_req || wl_req.join || wl_req.leave || wl_req.power_set) {
++		clear_wait(current_thread(), THREAD_AWAKENED);
++		return;
++	}
++	wr(wl_bar, Q_PCIE_INTR_ENABLE, WL_PCIE_INTR_MASK);   /* after assert_wait: an interrupt now still wakes us */
++	(void)rd(wl_bar, Q_PCIE_INTR_ENABLE);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * The data path: queued Ethernet frames out as native-wifi data, received
++ * frames go in through wl_rx_msdu; between them the thread sleeps until
++ * the chip interrupts (wl_idle), or polls every 1 ms without interrupts.
++ */
++static void
+ wl_run(void)
+ {
+ 	static uint8_t fr[ETHER_MAX_LEN];
+@@ -3170,6 +3246,15 @@
+ 	wl_aspm_off("data path");
+ 	wl_fast = true;                                 /* joins from here on: no step pauses */
+ 	wl_ready = true;
++	int irq = 1;
++	(void)PE_parse_boot_argn("natriumirq", &irq, sizeof(irq));
++	if (irq) {
++		wr(wl_bar, ce1.reg + CE_HOST_IE, 1u);   /* copy complete: HTT/HTC messages, WMI events */
++		wr(wl_bar, ce2.reg + CE_HOST_IE, 1u);
++		wl_irq_on = sweet_spi_attach(WL_IRQ_INTID, false, wl_irq, NULL);
++	}
++	uint64_t irq_check = wl_ms() + 20000;
++	printf("NATRIUM WLAN: data path on %s\n", wl_irq_on ? "interrupts (INTA, INTID 276)" : "1 ms polling");
+ 	for (;;) {
+ 		/* A BAR access over a dead link hangs the bus until the SoC resets: check first. */
+ 		if (!wl_link("data path")) {
+@@ -3181,8 +3266,8 @@
+ 		}
+ 		if (wl_ms() >= next) {                  /* status every 10 s */
+ 			next += 10000;
+-			printf("NATRIUM WLAN: run: tx %u (drop %u) rx %u, tx out %u, ifq %u, fw_ind %#x, ltssm %#x lnk %#x, %d.%d C (sensor %d.%d)\n", tx, txdrop,
+-			    wl_htt_rx - rx0, (uint16_t)(wl_tx_id - wl_txc_n), wl_ifq_count, rd(wl_bar, Q_FW_IND),
++			printf("NATRIUM WLAN: run: tx %u (drop %u) rx %u, irqs %u, tx out %u, ifq %u, fw_ind %#x, ltssm %#x lnk %#x, %d.%d C (sensor %d.%d)\n", tx, txdrop,
++			    wl_htt_rx - rx0, wl_irqs, (uint16_t)(wl_tx_id - wl_txc_n), wl_ifq_count, rd(wl_bar, Q_FW_IND),
+ 			    rd(wl_dbi, 0x728) & 0x3fu, rd(wl_dbi, DBI_LINK_STATUS) >> 16, wl_temp() / 10, (wl_temp() % 10 + 10) % 10,
+ 			    wl_temp_max_id / 16, wl_temp_max_id % 16);
+ 		}
+@@ -3260,8 +3345,20 @@
+ 			wl_rejoin(lost);
+ 			continue;
+ 		}
++		if (irq_check && wl_ms() >= irq_check) {
++			irq_check = 0;
++			if (wl_irq_on && !wl_irqs) {
++				sweet_spi_mask(WL_IRQ_INTID, true);
++				wl_irq_on = false;
++				printf("NATRIUM WLAN: no interrupt in 20 s: back to polling\n");
++			}
++		}
+ 		if (!m && eid == 0xff) {
+-			wl_msleep(1);
++			if (wl_irq_on) {
++				wl_idle();
++			} else {
++				wl_msleep(1);
++			}
+ 		}
+ 	}
+ }
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -128,6 +128,50 @@
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * Attention as an interrupt: TLMM GPIO 125 level-low into the TLMM summary
++ * interrupt (GIC SPI 208, INTID 240; live DT pinctrl@1010000). INTR_CFG
++ * (+0x8): bit 0 enable, 1 polarity (0 low), 3:2 detection (0 level), 4 raw
++ * status, 7:5 target (3 = apps); INTR_STATUS (+0xc) bit 0, cleared by
++ * writing 0 (Linux pinctrl-msm8996). The handler masks the pin and wakes
++ * the thread, which reads the report and unmasks it.
++ */
++#define TOUCH_IRQ_INTID         240u
++#define TLMM_INTR_CFG           0x8u
++#define TLMM_INTR_STATUS        0xcu
++#define TLMM_INTR_CFG_ON        ((3u << 5) | (1u << 4))        /* apps target, raw status, level low */
++extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
++extern void sweet_spi_mask(uint32_t intid, bool masked);
++static volatile bool touch_irq_on;
++static volatile uint32_t touch_irqs, touch_irq_others;
++
++static void
++touch_irq(__unused void *arg)
++{
++	vm_offset_t g = st.gpio[3];
++	if (touch_rd(g, TLMM_INTR_STATUS) & 1u) {
++		touch_wr(g, TLMM_INTR_CFG, TLMM_INTR_CFG_ON);   /* masked until the thread has read the report */
++		touch_wr(g, TLMM_INTR_STATUS, 0);
++		touch_irqs++;
++		thread_wakeup(&touch_sleep_chan);
++	} else if (++touch_irq_others > 1000) {
++		sweet_spi_mask(TOUCH_IRQ_INTID, true);  /* another pin holds the summary line: back to polling */
++		touch_irq_on = false;
++		thread_wakeup(&touch_sleep_chan);
++	}
++}
++
++/* Unmask the attention interrupt and sleep until it fires (or ms pass). */
++static void
++touch_irq_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
++	touch_wr(st.gpio[3], TLMM_INTR_CFG, TLMM_INTR_CFG_ON | 1u);    /* after assert_wait: no lost wakeup */
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ /* idx into st.gpio: 0 SDA, 1 SCL, 2 reset, 3 attention, 4 I2C mux; ma 2..16 */
+ static void
+ touch_gpio(unsigned idx, unsigned func, unsigned pull, unsigned ma, bool out, bool high)
+@@ -506,11 +550,22 @@
+ 	if (!qup_init() || !rmi_init()) {
+ 		goto out;
+ 	}
+-	printf("SWEET TOUCH: running, poll 10 ms on attention gpio%u\n", TOUCH_ATTN);
++	int irq = 1;
++	(void)PE_parse_boot_argn("sweettouchirq", &irq, sizeof(irq));
++	if (irq) {
++		touch_wr(st.gpio[3], TLMM_INTR_CFG, TLMM_INTR_CFG_ON);
++		touch_wr(st.gpio[3], TLMM_INTR_STATUS, 0);
++		touch_irq_on = sweet_spi_attach(TOUCH_IRQ_INTID, false, touch_irq, NULL);
++	}
++	printf("SWEET TOUCH: running, %s on attention gpio%u\n", touch_irq_on ? "interrupt" : "poll 10 ms", TOUCH_ATTN);
+ 	unsigned errors = 0, ticks = 0;
+ 	for (;;) {
+-		/* Attention is low while a report is pending; poll anyway every 200 ms. */
+-		if (!(touch_rd(st.gpio[3], 4) & 1u) || (++ticks % 20u) == 0) {
++		/*
++		 * Attention is low while a report is pending. Polling: look every
++		 * 10 ms, read anyway every 200 ms. Interrupt: woken by it, or read
++		 * anyway after a second.
++		 */
++		if (!(touch_rd(st.gpio[3], 4) & 1u) || touch_irq_on || (++ticks % 20u) == 0) {
+ 			int err = touch_poll();
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+@@ -525,7 +580,15 @@
+ 				errors = 0;
+ 			}
+ 		}
+-		touch_wait(10);
++		if (touch_irq_on) {
++			touch_irq_wait(1000);
++		} else {
++			if (touch_irq_others > 1000 && touch_irq_others < 2000) {
++				touch_irq_others = 2000;
++				printf("SWEET TOUCH: summary interrupt held by another pin (%u interrupts): polling\n", touch_irqs);
++			}
++			touch_wait(10);
++		}
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());

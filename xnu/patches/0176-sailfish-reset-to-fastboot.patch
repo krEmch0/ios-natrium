@@ -1,0 +1,24 @@
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -566,7 +566,20 @@
+ void
+ sweet_perf_init(void)
+ {
+-	int fastboot = 0;
++	int fastboot = 0, resetfb = 0;
++	/*
++	 * Boot-arg sweetresetfb=1: any later reset (panic, watchdog) enters
++	 * fastboot instead of booting Linux, which would overwrite the panic
++	 * text in pstore. ABL clears the reason on every boot.
++	 */
++	if (PE_parse_boot_argn("sweetresetfb", &resetfb, sizeof(resetfb)) && resetfb) {
++		vm_offset_t imem = ml_io_map(0x066bf000, 0x1000);
++		if (imem) {
++			*(volatile uint32_t *)(imem + 0x65c) = 0x77665500;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			printf("SWEET FASTBOOT: any reset now enters fastboot (pstore kept)\n");
++		}
++	}
+ 	if (PE_parse_boot_argn("sweetfastboot", &fastboot, sizeof(fastboot)) && fastboot > 0) {
+ 		thread_t t;
+ 		if (kernel_thread_start(fastboot_thread, (void *)(uintptr_t)fastboot, &t) == KERN_SUCCESS) {

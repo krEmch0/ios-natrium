@@ -1,0 +1,858 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -21,3 +21,18 @@
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++
++# Apple IONetworkingFamily-170.140.2, staged by xnu/patches/0175-stage-ionetworking.sh
++iokit/IOKit/network/IOEthernetController.cpp                     optional iokitcpp
++iokit/IOKit/network/IOEthernetInterface.cpp                      optional iokitcpp
++iokit/IOKit/network/IOKernelDebugger.cpp                         optional iokitcpp
++iokit/IOKit/network/IOMbufMemoryCursor.cpp                       optional iokitcpp
++iokit/IOKit/network/IONetworkController.cpp                      optional iokitcpp
++iokit/IOKit/network/IONetworkData.cpp                            optional iokitcpp
++iokit/IOKit/network/IONetworkInterface.cpp                       optional iokitcpp
++iokit/IOKit/network/IONetworkMedium.cpp                          optional iokitcpp
++iokit/IOKit/network/IONetworkStack.cpp                           optional iokitcpp
++iokit/IOKit/network/IONetworkUserClient.cpp                      optional iokitcpp
++iokit/IOKit/network/IOOutputQueue.cpp                            optional iokitcpp
++iokit/IOKit/network/IOPacketQueue.cpp                            optional iokitcpp
++iokit/Kernel/arm/NatriumWLAN.cpp                                optional iokitcpp
+--- a/iokit/conf/Makefile.template
++++ b/iokit/conf/Makefile.template
+@@ -57,6 +57,16 @@
+ 
+ %MACHDEP
+ 
++# Apple IONetworkingFamily (staged into iokit/IOKit/network): built as
++# Apple builds the kext (__PRIVATE_SPI__), with the private BSD headers
++# (net/dlil.h -> net/classq) from the source tree.
++NATRIUM_NET_FILES = IOEthernetController IOEthernetInterface IOKernelDebugger \
++	IOMbufMemoryCursor IONetworkController IONetworkData IONetworkInterface \
++	IONetworkMedium IONetworkStack IONetworkUserClient IOOutputQueue IOPacketQueue
++$(foreach f,$(NATRIUM_NET_FILES),$(eval $(f).cpo_CFLAGS_ADD += -D__PRIVATE_SPI__))
++$(foreach f,$(NATRIUM_NET_FILES),$(eval $(f).cpo_INCFLAGS = -I$(SRCROOT)/bsd -I$(SRCROOT)/iokit/IOKit/network))
++NatriumWLAN.cpo_CFLAGS_ADD += -D__PRIVATE_SPI__
++
+ #
+ # Diagnostic opt-outs.  We need to make this list empty.
+ #
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -87,6 +87,18 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetGPU;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IONetworkStack;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOResourceMatch' = IOBSD;"
++    "     'IOMatchCategory' = IONetworkStack;"
++    "   },"
++    "   {"
++    "     'IOClass'         = NatriumWLAN;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOResourceMatch' = IOBSD;"
++    "     'IOMatchCategory' = NatriumWLAN;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+--- /dev/null
++++ b/iokit/Kernel/arm/NatriumWLAN.cpp
+@@ -0,0 +1,204 @@
++/*
++ * The Pixel 1's QCA6174 Wi-Fi as an IOEthernetController, so that iOS's
++ * configd names it (en0 through IONetworkStack) and IPConfiguration runs
++ * DHCP on it. The radio, firmware, association and WPA2 live in
++ * bsd/dev/natrium_wlan.c; this class only bridges frames and link state.
++ *
++ * The IORegistry is held busy from start() until the interface exists:
++ * configd builds the first network configuration (a DHCP service per
++ * interface, kept in preferences.plist) when IOKit goes quiet.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/network/IOEthernetController.h>
++#include <IOKit/network/IOEthernetInterface.h>
++#include <IOKit/network/IONetworkMedium.h>
++#include <IOKit/network/IOOutputQueue.h>      /* kIOReturnOutputSuccess */
++#include <pexpert/pexpert.h>
++
++/* bsd/dev/natrium_wlan.c */
++extern "C" void natrium_wlan_output(mbuf_t m);
++
++#define WLAN_SPEED      54000000ULL     /* legacy 11g rates for now */
++
++class NatriumWLAN : public IOEthernetController {
++	OSDeclareDefaultStructors(NatriumWLAN);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	bool createWorkLoop(void) APPLE_KEXT_OVERRIDE;
++	IOWorkLoop *getWorkLoop(void) const APPLE_KEXT_OVERRIDE;
++	IOReturn enable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
++	IOReturn disable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
++	IOReturn getHardwareAddress(IOEthernetAddress *addr) APPLE_KEXT_OVERRIDE;
++	UInt32 outputPacket(mbuf_t m, void *param) APPLE_KEXT_OVERRIDE;
++	IOReturn setMulticastMode(bool active) APPLE_KEXT_OVERRIDE;
++	IOReturn setMulticastList(IOEthernetAddress *addrs, UInt32 count) APPLE_KEXT_OVERRIDE;
++	IOReturn setPromiscuousMode(bool active) APPLE_KEXT_OVERRIDE;
++
++	void attach(const uint8_t *mac);
++	void link(bool up);
++	void input(mbuf_t m);
++private:
++	IOWorkLoop *fLoop;
++	IOEthernetInterface *fNetif;
++	IONetworkMedium *fMedium;
++	IOEthernetAddress fMac;
++	bool fBusy;
++};
++OSDefineMetaClassAndStructors(NatriumWLAN, IOEthernetController);
++#define super IOEthernetController
++
++static NatriumWLAN *gWLAN;
++
++bool
++NatriumWLAN::start(IOService *provider)
++{
++	int on = 0;
++	if (!PE_parse_boot_argn("natriumwlan", &on, sizeof(on)) || !on) {
++		return false;
++	}
++	IOLog("NATRIUM WLAN: IOEthernetController start\n");
++	if (!super::start(provider)) {
++		IOLog("NATRIUM WLAN: IONetworkController::start FAILED\n");
++		return false;
++	}
++	OSDictionary *media = OSDictionary::withCapacity(1);
++	fMedium = IONetworkMedium::medium(kIOMediumEthernetAuto, WLAN_SPEED);
++	if (!media || !fMedium || !IONetworkMedium::addMedium(media, fMedium) || !publishMediumDictionary(media)) {
++		IOLog("NATRIUM WLAN: medium dictionary FAILED\n");
++		OSSafeReleaseNULL(media);
++		return false;
++	}
++	media->release();
++	fBusy = true;
++	adjustBusy(1);          /* until attach(): configd waits for IOKit quiet */
++	gWLAN = this;
++	IOLog("NATRIUM WLAN: IOEthernetController started, waiting for the radio\n");
++	return true;
++}
++
++bool
++NatriumWLAN::createWorkLoop(void)
++{
++	fLoop = IOWorkLoop::workLoop();
++	return fLoop != NULL;
++}
++
++IOWorkLoop *
++NatriumWLAN::getWorkLoop(void) const
++{
++	return fLoop;
++}
++
++IOReturn
++NatriumWLAN::enable(IONetworkInterface *netif __unused)
++{
++	return kIOReturnSuccess;
++}
++
++IOReturn
++NatriumWLAN::disable(IONetworkInterface *netif __unused)
++{
++	return kIOReturnSuccess;
++}
++
++IOReturn
++NatriumWLAN::getHardwareAddress(IOEthernetAddress *addr)
++{
++	*addr = fMac;
++	return kIOReturnSuccess;
++}
++
++UInt32
++NatriumWLAN::outputPacket(mbuf_t m, void *param __unused)
++{
++	natrium_wlan_output(m);        /* takes the mbuf */
++	return kIOReturnOutputSuccess;
++}
++
++/* The firmware passes all multicast and broadcast frames of the BSS. */
++IOReturn
++NatriumWLAN::setMulticastMode(bool active __unused)
++{
++	return kIOReturnSuccess;
++}
++
++IOReturn
++NatriumWLAN::setMulticastList(IOEthernetAddress *addrs __unused, UInt32 count __unused)
++{
++	return kIOReturnSuccess;
++}
++
++IOReturn
++NatriumWLAN::setPromiscuousMode(bool active __unused)
++{
++	return kIOReturnSuccess;
++}
++
++/* The radio knows its MAC address (or failed: mac NULL): publish the interface, release IOKit. */
++void
++NatriumWLAN::attach(const uint8_t *mac)
++{
++	if (mac) {
++		memcpy(fMac.bytes, mac, sizeof(fMac.bytes));
++		setLinkStatus(kIONetworkLinkValid, NULL);
++		if (attachInterface((IONetworkInterface **)&fNetif, true)) {
++			IOLog("NATRIUM WLAN: IOEthernetInterface attached\n");
++		} else {
++			IOLog("NATRIUM WLAN: attachInterface FAILED\n");
++		}
++	}
++	if (fBusy) {
++		fBusy = false;
++		adjustBusy(-1);
++	}
++}
++
++void
++NatriumWLAN::link(bool up)
++{
++	setLinkStatus(up ? kIONetworkLinkValid | kIONetworkLinkActive : kIONetworkLinkValid, up ? fMedium : NULL,
++	    up ? WLAN_SPEED : 0);
++	IOLog("NATRIUM WLAN: link %s\n", up ? "up" : "down");
++}
++
++void
++NatriumWLAN::input(mbuf_t m)
++{
++	if (fNetif) {
++		fNetif->inputPacket(m);
++	} else {
++		mbuf_freem(m);
++	}
++}
++
++/* For bsd/dev/natrium_wlan.c (its thread runs after IOKit matched us, or never finds gWLAN). */
++extern "C" bool
++natrium_wlan_iokit_attach(const uint8_t *mac)
++{
++	if (!gWLAN) {
++		return false;
++	}
++	gWLAN->attach(mac);
++	return true;
++}
++
++extern "C" void
++natrium_wlan_iokit_link(bool up)
++{
++	if (gWLAN) {
++		gWLAN->link(up);
++	}
++}
++
++extern "C" void
++natrium_wlan_iokit_input(mbuf_t m)
++{
++	if (gWLAN) {
++		gWLAN->input(m);
++	} else {
++		mbuf_freem(m);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/natrium_wlan.c
++++ b/bsd/dev/natrium_wlan.c
+@@ -116,6 +116,7 @@
+ #define PCS_                            0x1400u
+ 
+ static vm_offset_t wl_gcc, wl_parf, wl_phy, wl_dbi, wl_conf, wl_perst, wl_boot, wl_clkreq, wl_wake;
++static void wl_aspm_off(const char *when);
+ 
+ static inline uint32_t
+ rd(vm_offset_t b, uint32_t o)
+@@ -578,6 +579,7 @@
+ 	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x8, 1u << 31);          /* enable */
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	uint32_t id = rd(wl_conf, 0), rev = rd(wl_conf, 8);
++	wl_aspm_off("enumeration");
+ 	printf("NATRIUM WLAN: endpoint id %#x class/rev %#x bar0 %#x%s\n", id, rev, rd(wl_conf, 0x10),
+ 	    id == 0x003e168cu ? " = QCA6174" : "");
+ 	return id == 0x003e168cu;
+@@ -1451,11 +1453,14 @@
+ static int32_t wl_txc_id = -1;                  /* last HTT tx completion: msdu id, status */
+ static uint16_t wl_txc_n;                       /* tx completions so far (data and management) */
+ static uint32_t wl_txc_status;
+-static uint8_t wl_eapol[512], wl_ip[1600];     /* last EAPOL-Key frame and IPv4 packet received */
+-static uint32_t wl_eapol_len, wl_ip_len;
+-static ifnet_t wl_ifp;                          /* en0 once DHCP is done: data frames go to the stack */
++static uint8_t wl_eapol[512];                   /* last EAPOL-Key frame received */
++static uint32_t wl_eapol_len;
++static bool wl_net_up;                          /* connected: data frames go to the IOKit interface */
++extern bool natrium_wlan_iokit_attach(const uint8_t *mac);    /* iokit/Kernel/arm/NatriumWLAN.cpp */
++extern void natrium_wlan_iokit_link(bool up);
++extern void natrium_wlan_iokit_input(mbuf_t m);
+ 
+-/* Native-wifi data frame (header, LLC/SNAP at o) -> Ethernet frame into en0. */
++/* Native-wifi data frame (header, LLC/SNAP at o) -> Ethernet frame to the interface. */
+ static void
+ wl_if_input(const volatile uint8_t *p, uint32_t len, uint32_t o)
+ {
+@@ -1466,7 +1471,6 @@
+ 		if (m) {
+ 			mbuf_freem(m);
+ 		}
+-		ifnet_stat_increment_in(wl_ifp, 0, 0, 1);
+ 		return;
+ 	}
+ 	uint8_t *e = mbuf_data(m);
+@@ -1476,14 +1480,9 @@
+ 	e[12] = p[o + 6];
+ 	e[13] = p[o + 7];
+ 	memcpy(e + ETHER_HDR_LEN, (const void *)(p + o + 8), n);
+-	struct ifnet_stat_increment_param st = { .packets_in = 1, .bytes_in = ETHER_HDR_LEN + n };
+ 	mbuf_setlen(m, ETHER_HDR_LEN + n);
+ 	mbuf_pkthdr_setlen(m, ETHER_HDR_LEN + n);
+-	mbuf_pkthdr_setrcvif(m, wl_ifp);
+-	mbuf_pkthdr_setheader(m, e);
+-	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
+-	(void)mbuf_setdata(m, e + ETHER_HDR_LEN, n);
+-	ifnet_input(wl_ifp, m, &st);
++	natrium_wlan_iokit_input(m);
+ }
+ 
+ /*
+@@ -1502,17 +1501,16 @@
+ 			continue;
+ 		}
+ 		uint16_t type = (uint16_t)(p[o + 6] << 8 | p[o + 7]);
+-		if (wl_ifp && type != 0x888e && (p[0] & 0x0c) == 0x08) {
++		if (wl_net_up && type != 0x888e && (p[0] & 0x0c) == 0x08) {
+ 			wl_if_input(p, len, o);
+ 			return;
+ 		}
+-		uint8_t *dst = type == 0x888e ? wl_eapol : type == 0x0800 ? wl_ip : NULL;
+-		uint32_t n = len - o - 8, max = type == 0x888e ? sizeof(wl_eapol) : sizeof(wl_ip);
+-		if (dst && n <= max) {
+-			for (uint32_t i = 0; i < n; i++) {
+-				dst[i] = p[o + 8 + i];
++		uint32_t n = len - o - 8;
++		if (type == 0x888e && n <= sizeof(wl_eapol)) {
++			for (uint32_t i = 0; i < n; i++) {
++				wl_eapol[i] = p[o + 8 + i];
+ 			}
+-			*(type == 0x888e ? &wl_eapol_len : &wl_ip_len) = n;
++			wl_eapol_len = n;
+ 		}
+ 		return;
+ 	}
+@@ -2386,8 +2384,8 @@
+ 	p[3] = flags1 >> 8;
+ 	p[4] = len & 0xff;
+ 	p[5] = (uint8_t)(len >> 8);
+-	p[6] = id & 0xff;
+-	p[7] = (uint8_t)(id >> 8);
++	p[6] = (uint8_t)slot;                           /* msdu id: the firmware's descriptor index, < num_msdu_desc */
++	p[7] = 0;
+ 	for (int i = 0; i < 4; i++) {
+ 		p[8 + i] = (uint8_t)(pa >> (8 * i));
+ 	}
+@@ -2401,10 +2399,11 @@
+ static bool
+ wl_tx_wait(uint32_t ms)
+ {
+-	for (uint64_t end = wl_ms() + ms; wl_ms() < end && wl_txc_id != wl_tx_id;) {
++	int32_t slot = (int32_t)(wl_tx_id % WL_TXSLOTS);
++	for (uint64_t end = wl_ms() + ms; wl_ms() < end && wl_txc_id != slot;) {
+ 		(void)wl_htc_poll(10);
+ 	}
+-	return wl_txc_id == wl_tx_id;
++	return wl_txc_id == slot;
+ }
+ 
+ /* 802.11 header to the BSS: A1 BSSID, A2 us, A3 a3. */
+@@ -2592,263 +2591,121 @@
+ 	bzero(ptk, sizeof(ptk));
+ 	bzero(gtk, sizeof(gtk));
+ 	return done;
+-}
+-
+-/*
+- * DHCP (RFC 2131) from the kernel: DISCOVER -> OFFER -> REQUEST -> ACK.
+- * The lease (address, mask, router, DNS) configures en0.
+- */
+-static uint8_t wl_lease_ip[4], wl_lease_mask[4], wl_lease_gw[4], wl_lease_dns[4], wl_lease_srv[4];
+-static uint32_t wl_lease_secs;
+-
+-static bool
+-wl_dhcp_send(const uint8_t xid[4], uint8_t type)
+-{
+-	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+-	static uint8_t ip[328];
+-	uint8_t *u = ip + 20, *d = u + 8, *o = d + 240;
+-	bzero(ip, sizeof(ip));
+-	ip[0] = 0x45;
+-	ip[2] = sizeof(ip) >> 8;
+-	ip[3] = sizeof(ip) & 0xff;
+-	ip[8] = 64;
+-	ip[9] = 17;
+-	memset(ip + 16, 0xff, 4);
+-	uint32_t sum = 0;
+-	for (int i = 0; i < 20; i += 2) {
+-		sum += (uint32_t)(ip[i] << 8 | ip[i + 1]);
+-	}
+-	sum = (sum & 0xffff) + (sum >> 16);
+-	sum = ~(sum + (sum >> 16)) & 0xffff;
+-	ip[10] = (uint8_t)(sum >> 8);
+-	ip[11] = (uint8_t)sum;
+-	u[1] = 68;
+-	u[3] = 67;
+-	u[4] = (sizeof(ip) - 20) >> 8;
+-	u[5] = (sizeof(ip) - 20) & 0xff;
+-	d[0] = 1;                                       /* BOOTREQUEST, ethernet */
+-	d[1] = 1;
+-	d[2] = 6;
+-	memcpy(d + 4, xid, 4);
+-	d[10] = 0x80;                                   /* broadcast reply */
+-	memcpy(d + 28, wl_mac, 6);
+-	static const uint8_t magic[4] = { 0x63, 0x82, 0x53, 0x63 };
+-	memcpy(d + 236, magic, 4);
+-	*o++ = 53;
+-	*o++ = 1;
+-	*o++ = type;
+-	if (type == 3) {                                /* REQUEST: the offered address from that server */
+-		*o++ = 50;
+-		*o++ = 4;
+-		memcpy(o, wl_lease_ip, 4);
+-		o += 4;
+-		*o++ = 54;
+-		*o++ = 4;
+-		memcpy(o, wl_lease_srv, 4);
+-		o += 4;
+-	}
+-	static const uint8_t prl[] = { 55, 4, 1, 3, 6, 51, 12, 7, 's', 'a', 'i', 'l', 'f', 'i', 's', 'h', 255 };
+-	memcpy(o, prl, sizeof(prl));
+-	return wl_data_tx(bcast, 0x0800, ip, sizeof(ip));
+-}
+-
+-/* Wait for a reply of DHCP type want (2 OFFER, 5 ACK) to xid; fills the lease. Returns its type, 0 on timeout. */
+-static uint8_t
+-wl_dhcp_wait(const uint8_t xid[4], uint8_t want, uint32_t ms)
+-{
+-	for (uint64_t end = wl_ms() + ms; wl_ms() < end;) {
+-		(void)wl_htc_poll(10);
+-		if (wl_ip_len < 28 + 240 || wl_ip[9] != 17) {
+-			continue;
+-		}
+-		uint32_t n = wl_ip_len, ihl = (wl_ip[0] & 15u) * 4;
+-		const uint8_t *ru = wl_ip + ihl, *rd = ru + 8;
+-		wl_ip_len = 0;
+-		if (ihl + 8 + 240 > n || ru[3] != 68 || rd[0] != 2 || memcmp(rd + 4, xid, 4) != 0) {
+-			continue;
+-		}
+-		uint8_t type = 0;
+-		for (uint32_t i = ihl + 8 + 240; i + 2 <= n && wl_ip[i] != 255; i += wl_ip[i] ? 2u + wl_ip[i + 1] : 1u) {
+-			const uint8_t *v = &wl_ip[i + 2];
+-			uint8_t c = wl_ip[i], l = wl_ip[i + 1];
+-			if (c == 0 || i + 2 + l > n) {
+-				continue;
+-			}
+-			if (c == 53 && l >= 1) {
+-				type = v[0];
+-			} else if (c == 1 && l >= 4) {
+-				memcpy(wl_lease_mask, v, 4);
+-			} else if (c == 3 && l >= 4) {
+-				memcpy(wl_lease_gw, v, 4);
+-			} else if (c == 6 && l >= 4) {
+-				memcpy(wl_lease_dns, v, 4);
+-			} else if (c == 54 && l >= 4) {
+-				memcpy(wl_lease_srv, v, 4);
+-			} else if (c == 51 && l >= 4) {
+-				wl_lease_secs = (uint32_t)v[0] << 24 | (uint32_t)v[1] << 16 | (uint32_t)v[2] << 8 | v[3];
+-			}
+-		}
+-		if (type == want || type == 6) {        /* 6: NAK */
+-			memcpy(wl_lease_ip, rd + 16, 4);
+-			return type;
+-		}
+-	}
+-	return 0;
+ }
+ 
+-static bool
+-wl_dhcp(void)
+-{
+-	uint8_t xid[4], got = 0;
+-	read_random(xid, 4);
+-	for (int tries = 0; tries < 4 && got != 2; tries++) {
+-		got = wl_dhcp_send(xid, 1) ? wl_dhcp_wait(xid, 2, 3000) : 0;
+-	}
+-	if (got != 2) {
+-		printf("NATRIUM WLAN: DHCP: no OFFER (%u MSDUs received)\n", wl_htt_rx);
+-		return false;
+-	}
+-	for (int tries = 0; tries < 4 && got != 5 && got != 6; tries++) {
+-		got = wl_dhcp_send(xid, 3) ? wl_dhcp_wait(xid, 5, 3000) : 0;
+-	}
+-	printf("NATRIUM WLAN: DHCP %s: %u.%u.%u.%u/%u.%u.%u.%u router %u.%u.%u.%u dns %u.%u.%u.%u lease %u s\n",
+-	    got == 5 ? "ACK" : got == 6 ? "NAK" : "no ACK", wl_lease_ip[0], wl_lease_ip[1], wl_lease_ip[2], wl_lease_ip[3],
+-	    wl_lease_mask[0], wl_lease_mask[1], wl_lease_mask[2], wl_lease_mask[3], wl_lease_gw[0], wl_lease_gw[1], wl_lease_gw[2],
+-	    wl_lease_gw[3], wl_lease_dns[0], wl_lease_dns[1], wl_lease_dns[2], wl_lease_dns[3], wl_lease_secs);
+-	return got == 5;
+-}
+-
+ /*
+- * en0: an Ethernet interface for the stack (as ue0 in sweet_usb.c). Output
+- * only queues; the Wi-Fi thread converts and sends (wl_run).
++ * Frames from the stack (NatriumWLAN::outputPacket): only queued here,
++ * the Wi-Fi thread converts and sends them (wl_run).
+  */
+ #define WL_IFQ 64u
+ static lck_mtx_t *wl_ifq_lock;
+ static mbuf_t wl_ifq[WL_IFQ];
+ static uint32_t wl_ifq_head, wl_ifq_count;
+ 
+-static errno_t
+-wl_if_output(ifnet_t ifp, mbuf_t m)
++void natrium_wlan_output(mbuf_t m);
++
++void
++natrium_wlan_output(mbuf_t m)
+ {
+ 	lck_mtx_lock(wl_ifq_lock);
+-	if (wl_ifq_count == WL_IFQ) {
++	if (wl_ifq_count == WL_IFQ || !wl_net_up) {
+ 		lck_mtx_unlock(wl_ifq_lock);
+ 		mbuf_freem(m);
+-		ifnet_stat_increment_out(ifp, 0, 0, 1);
+-		return 0;
++		return;
+ 	}
+ 	wl_ifq[(wl_ifq_head + wl_ifq_count++) % WL_IFQ] = m;
+ 	lck_mtx_unlock(wl_ifq_lock);
+-	ifnet_stat_increment_out(ifp, 1, mbuf_pkthdr_len(m), 0);
+-	return 0;
+ }
+ 
+-static errno_t
+-wl_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
++/* Extended capability id in config space at base (DBI for the RC, conf for the chip); 0 if absent. */
++static uint32_t
++wl_ext_cap(vm_offset_t base, uint32_t id)
+ {
+-	switch (cmd) {
+-	case SIOCSIFADDR:
+-	case SIOCAIFADDR:
+-		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
+-		return 0;
+-	case SIOCSIFFLAGS:
+-	case SIOCADDMULTI:
+-	case SIOCDELMULTI:
+-		return 0;
+-	default:
+-		return EOPNOTSUPP;
++	for (uint32_t p = 0x100, n = 0; p >= 0x100 && p < 0x1000 && n < 32; n++) {
++		uint32_t h = rd(base, p);
++		if ((h & 0xffffu) == id) {
++			return p;
++		}
++		p = h >> 20;
+ 	}
++	return 0;
+ }
+ 
++/*
++ * ASPM (L0s/L1) and L1 substates off on both ends, logging what was set
++ * (0175: silent SoC resets under traffic; Linux runs this link with L1/L1SS
++ * and a CLKREQ# handshake we never set up).
++ */
+ static void
+-wl_if_detach(ifnet_t ifp __unused)
++wl_aspm_off(const char *when)
+ {
++	uint32_t epc = 0, rcl = rd(wl_dbi, DBI_LINK_STATUS), epl = 0;
++	for (uint32_t p = rd(wl_conf, 0x34) & 0xfcu, n = 0; p && n < 16; p = (rd(wl_conf, p) >> 8) & 0xfcu, n++) {
++		if ((rd(wl_conf, p) & 0xffu) == 0x10) {
++			epc = p;
++			break;
++		}
++	}
++	if (epc) {
++		epl = rd(wl_conf, epc + 0x10);
++	}
++	uint32_t rcs = wl_ext_cap(wl_dbi, 0x1e), eps = wl_ext_cap(wl_conf, 0x1e);
++	uint32_t rcsc = rcs ? rd(wl_dbi, rcs + 8) : 0, epsc = eps ? rd(wl_conf, eps + 8) : 0;
++	printf("NATRIUM WLAN: link PM %s: rc lnkctl %#x l1ss %#x, ep lnkctl %#x l1ss %#x (cap %#x/%#x)\n", when, rcl & 0xffffu,
++	    rcsc, epl & 0xffffu, epsc, rcs, eps);
++	if (eps) {
++		wr(wl_conf, eps + 8, epsc & ~0xfu);
++	}
++	if (epc) {
++		wr(wl_conf, epc + 0x10, epl & ~3u);
++	}
++	if (rcs) {
++		wr(wl_dbi, rcs + 8, rcsc & ~0xfu);
++	}
++	wr(wl_dbi, DBI_LINK_STATUS, rcl & ~3u);
+ }
+ 
+-static void
+-wl_sin(struct sockaddr_in *a, const uint8_t ip[4])
+-{
+-	bzero(a, sizeof(*a));
+-	a->sin_len = sizeof(*a);
+-	a->sin_family = AF_INET;
+-	memcpy(&a->sin_addr, ip, 4);
+-}
++/*
++ * Hottest TSENS sensor in 0.1 C (tsens-v2: TM block + 0xa0 + 4n, bits 0-11
++ * signed last temperature, bit 21 valid; MSM8996 TM at 0x4a9000 with 13
++ * sensors, 0x4ad000 with 8). The port has no thermal management.
++ */
++static int wl_temp_max_id;
+ 
+-static bool
+-wl_if_create(void)
++static int
++wl_temp(void)
+ {
+-	struct ifnet_init_eparams init;
+-	ifnet_t ifp = NULL;
+-	wl_ifq_lock = lck_mtx_alloc_init(lck_grp_alloc_init("natrium_wlan", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
+-	bzero(&init, sizeof(init));
+-	init.ver = IFNET_INIT_CURRENT_VERSION;
+-	init.len = sizeof(init);
+-	init.flags = IFNET_INIT_LEGACY;
+-	init.uniqueid = "natrium-wlan";
+-	init.uniqueid_len = sizeof("natrium-wlan") - 1;
+-	init.name = "en";
+-	init.unit = 0;
+-	init.family = IFNET_FAMILY_ETHERNET;
+-	init.type = IFT_ETHER;
+-	init.output = wl_if_output;
+-	init.demux = ether_demux;
+-	init.add_proto = ether_add_proto;
+-	init.del_proto = ether_del_proto;
+-	init.check_multi = ether_check_multi;
+-	init.framer_extended = ether_frameout_extended;
+-	init.ioctl = wl_if_ioctl;
+-	init.detach = wl_if_detach;
+-	init.broadcast_addr = etherbroadcastaddr;
+-	init.broadcast_len = ETHER_ADDR_LEN;
+-	if (ifnet_allocate_extended(&init, &ifp) != 0) {
+-		printf("NATRIUM WLAN: en0: ifnet_allocate failed\n");
+-		return false;
++	static vm_offset_t tm[2];
++	static const uint32_t pa[2] = { 0x4a9000u, 0x4ad000u }, n[2] = { 13, 8 };
++	static bool shown;
++	int max = -1000;
++	for (int b = 0; b < 2; b++) {
++		if (!tm[b]) {
++			tm[b] = ml_io_map(pa[b], 0x1000);
++		}
++		for (uint32_t i = 0; tm[b] && i < n[b]; i++) {
++			uint32_t v = rd(tm[b], 0xa0 + 4 * i);
++			int t = (int)(v & 0xfffu);
++			if (t & 0x800) {
++				t -= 0x1000;
++			}
++			if ((v & (1u << 21)) && t > max) {
++				max = t;
++				wl_temp_max_id = b * 16 + (int)i;
++			}
++		}
+ 	}
+-	ifnet_set_addrlen(ifp, ETHER_ADDR_LEN);
+-	ifnet_set_hdrlen(ifp, sizeof(struct ether_header));
+-	ifnet_set_mtu(ifp, ETHERMTU);
+-	ifnet_set_baudrate(ifp, 54000000);
+-	ifnet_set_flags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
+-	if (ifnet_attach(ifp, NULL) != 0) {
+-		printf("NATRIUM WLAN: en0: ifnet_attach failed\n");
+-		return false;
+-	}
+-	ifnet_set_lladdr(ifp, wl_mac, ETHER_ADDR_LEN);
+-	wl_ifp = ifp;
+-
+-	errno_t err = proto_plumb(PF_INET, ifp);
+-	socket_t so = NULL;
+-	if (err == 0) {
+-		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
+-	}
+-	if (err == 0) {
+-		struct ifaliasreq ifra;
+-		uint8_t bc[4];
+-		for (int i = 0; i < 4; i++) {
+-			bc[i] = (uint8_t)(wl_lease_ip[i] | ~wl_lease_mask[i]);
++	if (!shown && tm[0] && tm[1]) {          /* once: per sensor temp, upper/lower (+0x20) and critical (+0x60) thresholds */
++		shown = true;
++		for (int b = 0; b < 2; b++) {
++			for (uint32_t i = 0; i < n[b]; i++) {
++				printf("NATRIUM WLAN: tsens%d.%u status %#x thr %#x crit %#x\n", b, i, rd(tm[b], 0xa0 + 4 * i),
++				    rd(tm[b], 0x20 + 4 * i), rd(tm[b], 0x60 + 4 * i));
++			}
+ 		}
+-		bzero(&ifra, sizeof(ifra));
+-		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "en0");
+-		wl_sin((struct sockaddr_in *)&ifra.ifra_addr, wl_lease_ip);
+-		wl_sin((struct sockaddr_in *)&ifra.ifra_mask, wl_lease_mask);
+-		wl_sin((struct sockaddr_in *)&ifra.ifra_broadaddr, bc);
+-		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
+-		sock_close(so);
++		printf("NATRIUM WLAN: tsens int en %#x/%#x, crit int %#x/%#x\n", rd(tm[0], 0x4), rd(tm[1], 0x4), rd(tm[0], 0x18), rd(tm[1], 0x18));
+ 	}
+-	ifnet_set_flags(ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+-	int rerr = -1;
+-	if (err == 0 && wl_lease_gw[0]) {                /* default route via the router */
+-		static const uint8_t zero[4];
+-		struct sockaddr_in dst, gw, mask;
+-		wl_sin(&dst, zero);
+-		wl_sin(&gw, wl_lease_gw);
+-		wl_sin(&mask, zero);
+-		rerr = rtrequest(RTM_ADD, (struct sockaddr *)&dst, (struct sockaddr *)&gw, (struct sockaddr *)&mask,
+-		    RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
+-	}
+-	printf("NATRIUM WLAN: en0 %s: %u.%u.%u.%u (err %d), default route %s (err %d)\n", err ? "NOT configured" : "up",
+-	    wl_lease_ip[0], wl_lease_ip[1], wl_lease_ip[2], wl_lease_ip[3], err, rerr == 0 ? "set" : "NOT set", rerr);
+-	return err == 0;
++	return max;
+ }
+ 
+ /*
+@@ -2860,8 +2717,25 @@
+ wl_run(void)
+ {
+ 	static uint8_t fr[ETHER_MAX_LEN];
+-	uint32_t events = 0;
++	uint32_t events = 0, tx = 0, txdrop = 0, rx0 = wl_htt_rx;
++	uint64_t next = wl_ms() + 10000;
++	wl_aspm_off("data path");
+ 	for (;;) {
++		/* A BAR access over a dead link hangs the bus until the SoC resets: check first. */
++		if (!wl_link("data path")) {
++			printf("NATRIUM WLAN: data path stopped (tx %u, rx %u)\n", tx, wl_htt_rx - rx0);
++			sweet_log_kick();
++			for (;;) {
++				wl_msleep(1000);
++			}
++		}
++		if (wl_ms() >= next) {                  /* status every 10 s */
++			next += 10000;
++			printf("NATRIUM WLAN: run: tx %u (drop %u) rx %u, tx out %u, ifq %u, fw_ind %#x, ltssm %#x lnk %#x, %d.%d C (sensor %d.%d)\n", tx, txdrop,
++			    wl_htt_rx - rx0, (uint16_t)(wl_tx_id - wl_txc_n), wl_ifq_count, rd(wl_bar, Q_FW_IND),
++			    rd(wl_dbi, 0x728) & 0x3fu, rd(wl_dbi, DBI_LINK_STATUS) >> 16, wl_temp() / 10, (wl_temp() % 10 + 10) % 10,
++			    wl_temp_max_id / 16, wl_temp_max_id % 16);
++		}
+ 		mbuf_t m = NULL;
+ 		lck_mtx_lock(wl_ifq_lock);
+ 		if (wl_ifq_count) {
+@@ -2873,13 +2747,22 @@
+ 		if (m) {
+ 			size_t len = mbuf_pkthdr_len(m);
+ 			if (len > ETHER_HDR_LEN && len <= sizeof(fr) && mbuf_copydata(m, 0, len, fr) == 0) {
+-				(void)wl_data_tx(fr, (uint16_t)(fr[12] << 8 | fr[13]), fr + ETHER_HDR_LEN, (uint32_t)(len - ETHER_HDR_LEN));
++				if (wl_data_tx(fr, (uint16_t)(fr[12] << 8 | fr[13]), fr + ETHER_HDR_LEN, (uint32_t)(len - ETHER_HDR_LEN))) {
++					tx++;
++				} else {
++					txdrop++;
++				}
++			} else {
++				txdrop++;
+ 			}
+ 			mbuf_freem(m);
+ 		}
+ 		uint8_t eid = wl_htc_poll(0);
+ 		if (eid == wl_wmi_ep && wl_msg_len >= 4 && wl_noisy(le32(wl_msg) & 0xffffffu) && events++ < 50) {
+-			printf("NATRIUM WLAN: WMI event %#x (%u bytes)\n", le32(wl_msg) & 0xffffffu, wl_msg_len);
++			/* roam 0xb001 {vdev, reason (2 beacon miss, 3 low rssi), rssi}, kickout 0x6001 {mac, reason} */
++			printf("NATRIUM WLAN: WMI event %#x (%u bytes): %08x %08x %08x %08x\n", le32(wl_msg) & 0xffffffu, wl_msg_len,
++			    wl_msg_len >= 12 ? le32(&wl_msg[8]) : 0, wl_msg_len >= 16 ? le32(&wl_msg[12]) : 0,
++			    wl_msg_len >= 20 ? le32(&wl_msg[16]) : 0, wl_msg_len >= 24 ? le32(&wl_msg[20]) : 0);
+ 		}
+ 		if (!m && eid == 0xff) {
+ 			wl_msleep(1);
+@@ -2933,8 +2816,18 @@
+ 		(void)wl_htc_poll(10);                  /* HTT PEER_MAP */
+ 	}
+ 
+-	wl_step("auth");
++	/* Up to 5 rounds of auth + assoc; a deauth first clears the AP's state of an earlier session. */
++	int round = 0;
+ 	static uint8_t f[256];
++retry:
++	if (round > 0) {
++		uint32_t dn = wl_hdr(f, 0xc0, 0, wl_bss.bssid);
++		f[dn] = 3;                              /* reason: leaving */
++		f[dn + 1] = 0;
++		(void)wl_htt_tx(f, dn + 2, true);
++		wl_msleep(200);
++	}
++	wl_step("auth");
+ 	const uint8_t *rsp = NULL;
+ 	uint32_t n = wl_hdr(f, 0xb0, 0, wl_bss.bssid), rl = 0;
+ 	bzero(f + n, 6);
+@@ -2950,6 +2843,9 @@
+ 	printf("NATRIUM WLAN: auth: %s status %u (tx completion id %d status %u)\n", rsp ? "response" : "NO RESPONSE", st, wl_txc_id,
+ 	    wl_txc_status);
+ 	if (st) {
++		if (++round < 5) {
++			goto retry;
++		}
+ 		return false;
+ 	}
+ 
+@@ -2990,6 +2886,9 @@
+ 	st = rsp && rl >= 30 ? (rsp[26] | rsp[27] << 8) : 0xffff;
+ 	uint32_t aid = rsp && rl >= 30 ? (rsp[28] | rsp[29] << 8) & 0x3fffu : 0;
+ 	printf("NATRIUM WLAN: assoc: %s status %u aid %u\n", rsp ? "response" : "NO RESPONSE", st, aid);
++	if (st && ++round < 5) {
++		goto retry;
++	}
+ 	if (st) {
+ 		return false;
+ 	}
+@@ -3028,10 +2927,8 @@
+ 	}
+ 	printf("NATRIUM WLAN: CONNECTED to \"%s\" (WPA2-PSK, CCMP)\n", wl_ssid);
+ 	sweet_log_kick();
+-	wl_step("dhcp");
+-	if (!wl_dhcp() || !wl_if_create()) {
+-		return false;
+-	}
++	wl_net_up = true;
++	natrium_wlan_iokit_link(true);                 /* configd's IPConfiguration runs DHCP now */
+ 	sweet_log_kick();
+ 	wl_run();                                       /* does not return */
+ 	return true;
+@@ -3049,6 +2946,10 @@
+ 		if (ok) {
+ 			ok = wl_stage3();
+ 			printf("NATRIUM WLAN: stage 3 %s\n", ok ? "done: WMI ready" : "FAILED");
++			/* The interface appears with the MAC (link down until connected); IOKit may go quiet. */
++			if (!natrium_wlan_iokit_attach(ok ? wl_mac : NULL)) {
++				printf("NATRIUM WLAN: no NatriumWLAN IOKit service\n");
++			}
+ 			if (ok) {
+ 				ok = wl_scan();
+ 				printf("NATRIUM WLAN: scan %s\n", ok ? "found networks" : "FAILED");
+@@ -3060,6 +2961,7 @@
+ 		}
+ 		sweet_log_kick();
+ 	}
++	(void)natrium_wlan_iokit_attach(NULL);         /* failed: never keep IOKit busy */
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -3074,6 +2976,7 @@
+ 	if (!on) {
+ 		return;
+ 	}
++	wl_ifq_lock = lck_mtx_alloc_init(lck_grp_alloc_init("natrium_wlan", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
+ 	if (kernel_thread_start(wl_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

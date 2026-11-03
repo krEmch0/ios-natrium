@@ -1,0 +1,775 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@
+ bsd/dev/sweet_perf.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/natrium_wlan.c			standard
+ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -26,6 +26,10 @@
+ bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
+ bool sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz);
+ bool sweet_rpm_clk_scaling(void);
++bool sweet_rpm_xo_buffer(uint32_t id);
++bool sweet_rpm_smpa(unsigned smps, uint32_t uv);
++bool sweet_rpm_cx_corner(uint32_t corner);
++bool sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma);
+ 
+ static LCK_GRP_DECLARE(sweet_rpm_grp, "sweet_rpm");
+ static LCK_MTX_DECLARE(sweet_rpm_lock, &sweet_rpm_grp);
+@@ -372,10 +376,72 @@
+ 	bool ok = rpm_request("MX", 0, 0x61706d73u, 2, kv, 2);           /* "smpa" */
+ 	lck_mtx_unlock(&sweet_rpm_lock);
+ 	printf("SWEET RPM: MX corner %u: %s\n", corner, ok ? "ok" : "FAILED");
++	return ok;
++}
++
++/* LDOn on at uv with a load of ma (key "ma": the RPM picks high-power mode for it). */
++bool
++sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma)
++{
++	uint32_t kv[6] = {0x6e657773u, 1u, 0x00007675u, uv, 0x0000616du, ma};    /* swen, uv, ma */
++	char what[8];
++	snprintf(what, sizeof(what), "L%u", ldo);
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request(what, 0, 0x616f646cu, ldo, kv, 3);       /* "ldoa" */
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: L%u %u uV %u mA: %s\n", ldo, uv, ma, ok ? "ok" : "FAILED");
++	return ok;
++}
++
++/* Vote PM8994 SMPSn on at uv in the active set (RPM "smpa", like sweet_rpm_ldoa). */
++bool
++sweet_rpm_smpa(unsigned smps, uint32_t uv)
++{
++	uint32_t kv[4] = {0x6e657773u, 1u, 0x00007675u, uv};      /* swen = 1, uv */
++	char what[8];
++	snprintf(what, sizeof(what), "S%u", smps);
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request(what, 0, 0x61706d73u, smps, kv, 2);      /* "smpa" */
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: S%u %u uV: %s\n", smps, uv, ok ? "ok" : "FAILED");
++	return ok;
++}
++
++/*
++ * VDD_CX (PM8994 S1, RPM "smpa" 1) corner vote in the active set, like
++ * Linux's pm8994_s1_corner (key "corn" = corner - 1, as the MX vote). PCIe
++ * (qcom,vreg-cx-voltage-level <7 4 0>) needs at least corner 4 (nominal).
++ */
++bool
++sweet_rpm_cx_corner(uint32_t corner)
++{
++	uint32_t kv[4] = {0x6e657773u, 1u, 0x6e726f63u, corner - 1};   /* swen = 1, corn */
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request("CX", 0, 0x61706d73u, 1, kv, 2);           /* "smpa" */
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: CX corner %u: %s\n", corner, ok ? "ok" : "FAILED");
+ 	return ok;
+ }
+ 
+ /*
++ * XO buffer (RPM "clka", Linux DEFINE_CLK_RPM_SMD_XO_BUFFER) on in the sleep
++ * and the active set: key "swen" (RPM_KEY_SOFTWARE_ENABLE) = 1. NOT "Enab":
++ * the RPM acks that key and ignores it (0169a-r: LN_BB never came on).
++ * id 8 = LN_BB_CLK, the PCIe reference clock.
++ */
++bool
++sweet_rpm_xo_buffer(uint32_t id)
++{
++	uint32_t kv[2] = {0x6e657773u, 1u};                     /* "swen" */
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request("xo buffer sleep", 1, 0x616b6c63u, id, kv, 1) &&  /* "clka" */
++	    rpm_request("xo buffer active", 0, 0x616b6c63u, id, kv, 1);
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: XO buffer %u on: %s\n", id, ok ? "ok" : "FAILED");
++	return ok;
++}
++
++/*
+  * Clock vote in the sleep and the active set, like a Linux clk-smd-rpm
+  * clock without an _a twin: type e.g. "clk2" (memory clocks: id 0 bimc =
+  * DDR), key "KHz ", rate in kHz; the RPM rounds to a supported rate. Takes
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@
+ extern void sweet_perf_init(void);
+ extern void sweet_gpu_init(void);
+ extern void sweet_touch_init(void);
++extern void natrium_wlan_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -664,6 +665,7 @@
+ 	sweet_usb_probe();
+ 	sweet_perf_init();
+ 	sweet_gpu_init();
++	natrium_wlan_init();
+ 	return 0;
+ }
+ 
+@@ -739,6 +741,14 @@
+ 	uint32_t version, size;
+ 	uint64_t total, seq;
+ };
++
++/* Flush the console log now (bring-up code before a risky step). */
++void sweet_log_kick(void);
++void
++sweet_log_kick(void)
++{
++	wakeup(&sweet_log_chan);
++}
+ 
+ static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+--- /dev/null
++++ b/bsd/dev/natrium_wlan.c
+@@ -0,0 +1,643 @@
++/*
++ * Pixel 1 Wi-Fi, stage 1: power the QCA6174 ("Rome") and bring up PCIe root
++ * complex 0, its only host interface, then read the chip's config-space ID.
++ * Boot-arg natriumwlan=1 (off by default). Everything is logged ("NATRIUM WLAN:").
++ *
++ * As the Pixel's own kernel (msm-3.18: cnss_pci.c, pci-msm.c; live DT
++ * qcom,cnss and qcom,pcie@600000, phy-ver 3, common PHY, rc 0):
++ *   rails    RPM votes S3 1.3 V (vdd-wlan-core) and S4 1.8 V (vdd-wlan-io),
++ *            L30 1.8 V (xtal), L12 1.8 V + L28 0.925 V (PCIe PHY), in cnss
++ *            order (core, io, xtal). LN_BB XO buffer = PCIe refclk.
++ *   chip     PM8994 GPIO 9 (rome_vreg) high, 2 ms, TLMM 46 bootstrap high,
++ *            10 ms, PM8994 GPIO 8 (wlan_en) high, 10 ms.
++ *   PCIe     PERST (TLMM 35) low, GDSCs aggre0 noc + pcie_0, aux clock
++ *            1.0105 MHz (XO/19), branches, BCRs out of reset, PARF setup,
++ *            QMP PHY common + port tables, pipe clock, PHY ready, PERST high,
++ *            LTSSM, ELBI link up, iATU region 0 = CFG0 of bus 1.
++ * PMIC GPIO writes go through sweet_pmic_write (EE 0 owned peripherals only).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
++extern bool sweet_rpm_xo_buffer(uint32_t id);
++extern bool sweet_rpm_smpa(unsigned smps, uint32_t uv);
++extern bool sweet_rpm_cx_corner(uint32_t corner);
++extern bool sweet_rpm_ldoa_load(unsigned ldo, uint32_t uv, uint32_t ma);
++extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++extern bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
++extern void sweet_log_kick(void);
++void natrium_wlan_init(void);
++
++#define WL_GCC_PA       0x00300000u
++#define WL_TLMM_PA      0x01010000u     /* one 4 KiB tile per GPIO: CFG +0, IN_OUT +4 */
++#define WL_PARF_PA      0x00600000u
++#define WL_PHY_PA       0x00034000u
++#define WL_DBI_PA       0x0c000000u     /* dm_core; ELBI at +0xf20 */
++#define WL_CONF_PA      0x0c100000u
++
++#define WL_GPIO_PERST   35u
++#define WL_GPIO_CLKREQ  36u             /* function 1 = pci_e0 */
++#define WL_GPIO_WAKE    37u
++#define WL_GPIO_BOOT    46u
++#define WL_PMIC_ROME    0x0c8u          /* PM8994 GPIO 9 */
++#define WL_PMIC_EN      0x0c7u          /* PM8994 GPIO 8 */
++#define WL_PMIC_BT_EN   0x0d2u          /* PM8994 GPIO 19: bt_qca6174 qca,bt-reset-gpio */
++#define WL_PMIC_SLEEP   0x0d1u          /* PM8994 GPIO 18: SLEEP_CLK2, the chip's 32 kHz clock */
++
++/* GCC (msm-clocks-hwio-8996.h) */
++#define GCC_PCIE_0_SLV_AXI_CBCR         0x6b008u
++#define GCC_PCIE_0_MSTR_AXI_CBCR        0x6b00cu
++#define GCC_PCIE_0_CFG_AHB_CBCR         0x6b010u
++#define GCC_PCIE_0_AUX_CBCR             0x6b014u
++#define GCC_PCIE_0_PIPE_CBCR            0x6b018u
++#define GCC_PCIE_0_GDSCR                0x6b004u
++#define GCC_PCIE_0_PHY_BCR              0x6c01cu
++#define GCC_PCIE_AUX_CMD_RCGR           0x6c000u
++#define GCC_PCIE_PHY_BCR                0x6f000u
++#define GCC_PCIE_PHY_CFG_AHB_CBCR       0x6f004u
++#define GCC_PCIE_PHY_AUX_CBCR           0x6f008u
++#define GCC_PCIE_PHY_NOCSR_COM_PHY_BCR  0x6f00cu
++#define GCC_PCIE_PHY_COM_BCR            0x6f014u
++#define GCC_AGGRE0_NOC_GDSCR            0x81004u
++#define GCC_AGGRE0_SNOC_AXI_CBCR        0x81008u
++#define GCC_AGGRE0_CNOC_AHB_CBCR        0x8100cu
++#define GCC_SMMU_AGGRE0_AXI_CBCR        0x81014u
++#define GCC_SMMU_AGGRE0_AHB_CBCR        0x81018u
++#define GCC_PCIE_CLKREF_EN              0x88010u
++
++/* PARF / DBI / ELBI (pci-msm.c, msm8996 variant) */
++#define PARF_SYS_CTRL                   0x000u
++#define PARF_PHY_CTRL                   0x040u
++#define PARF_DBI_BASE_ADDR              0x168u
++#define PARF_SLV_ADDR_SPACE_SIZE        0x16cu
++#define PARF_MHI_CLOCK_RESET_CTRL       0x174u
++#define PARF_LTSSM                      0x1b0u
++#define DBI_DEVICE_CONTROL_STATUS       0x078u
++#define DBI_LINK_STATUS                 0x080u  /* bit 29: data link layer active */
++#define DBI_IATU_VIEWPORT               0x900u
++#define ELBI_SYS_STTS                   0xf28u  /* ELBI 0xf20 + 8 */
++#define XMLH_LINK_UP                    0x400u
++
++/* QMP PHY: common block, then lane 0 (TX 0x1000, RX 0x1200, PCS 0x1400) */
++#define PCIE_COM_SW_RESET               0x400u
++#define PCIE_COM_POWER_DOWN_CONTROL     0x404u
++#define PCIE_COM_START_CONTROL          0x408u
++#define PCIE_COM_PCS_READY_STATUS       0x448u
++#define TX_                             0x1000u
++#define RX_                             0x1200u
++#define PCS_                            0x1400u
++
++static vm_offset_t wl_gcc, wl_parf, wl_phy, wl_dbi, wl_conf, wl_perst, wl_boot, wl_clkreq, wl_wake;
++
++static inline uint32_t
++rd(vm_offset_t b, uint32_t o)
++{
++	uint32_t v = *(volatile uint32_t *)(b + o);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++}
++
++static void
++wl_msleep(uint32_t ms)
++{
++	delay(ms * 1000);
++}
++
++/*
++ * Bring-up trace: log, get it onto the disk, then go on. A bus hang on an
++ * unclocked register resets the phone (and ABL then boots Android, so the
++ * RAM console is lost): the persistent log is the only trace.
++ */
++static bool wl_fast;    /* chip on: no pauses until PERST (TWRP: WLAN_EN -> PERST ~0.1-0.2 s) */
++
++static void
++wl_step(const char *what)
++{
++	printf("NATRIUM WLAN: step %s\n", what);
++	if (!wl_fast) {
++		sweet_log_kick();
++		wl_msleep(300);
++	}
++}
++
++/* Map pa..pa+size (page-rounded); 0 on failure. */
++static vm_offset_t
++wl_map(uint64_t pa, uint32_t size)
++{
++	vm_offset_t va = ml_io_map(trunc_page_64(pa), round_page_64(size + (pa & PAGE_MASK)));
++	return va ? va + (pa & PAGE_MASK) : 0;
++}
++
++/* Branch clock on: CBCR bit 0, wait for CLK_OFF (bit 31) to clear. */
++static bool
++wl_branch(const char *name, uint32_t off, bool halt_check)
++{
++	wr(wl_gcc, off, rd(wl_gcc, off) | 1u);
++	for (int i = 0; halt_check && i < 200; i++) {
++		if (!(rd(wl_gcc, off) & (1u << 31))) {
++			return true;
++		}
++		delay(5);
++	}
++	if (halt_check) {
++		printf("NATRIUM WLAN: clock %s stays off (cbcr %#x)\n", name, rd(wl_gcc, off));
++	}
++	return !halt_check;
++}
++
++/* GDSC on: SW_COLLAPSE (bit 0) off, wait for PWR_ON (bit 31). */
++static bool
++wl_gdsc(const char *name, uint32_t off)
++{
++	uint32_t v = rd(wl_gcc, off);
++	wr(wl_gcc, off, v & ~1u);
++	for (int i = 0; i < 200; i++) {
++		if (rd(wl_gcc, off) & (1u << 31)) {
++			printf("NATRIUM WLAN: GDSC %s on (%#x -> %#x)\n", name, v, rd(wl_gcc, off));
++			return true;
++		}
++		delay(5);
++	}
++	printf("NATRIUM WLAN: GDSC %s FAILED (%#x -> %#x)\n", name, v, rd(wl_gcc, off));
++	return false;
++}
++
++/* TLMM pin as a GPIO output at level, drive (mA), pull (0 none, 1 down, 3 up). */
++static void
++wl_tlmm_out(vm_offset_t tile, unsigned level, unsigned ma, unsigned pull)
++{
++	wr(tile, 4, level ? 2u : 0u);                           /* IN_OUT: output value */
++	wr(tile, 0, (1u << 9) | ((ma / 2 - 1) << 6) | pull);    /* OE, drive, func 0 */
++}
++
++/*
++ * PMIC GPIO (PM8994) driven high as the live DT configures it (qpnp-pin):
++ * the output level comes from VIN_CTL (0x41), so the voltage source and
++ * the pull are set before the pin turns into an output.
++ * MODE_CTL: mode [6:4] = 1 digital output, source [3:1] = 0, invert bit 0.
++ */
++static bool
++wl_pmic_gpio_high(const char *name, uint16_t ppid, uint8_t vin, uint8_t pull)
++{
++	uint8_t mode = 0, vin0 = 0, pull0 = 0, en = 0, out = 0;
++	(void)sweet_pmic_read(ppid, 0x40, &mode);
++	(void)sweet_pmic_read(ppid, 0x41, &vin0);
++	(void)sweet_pmic_read(ppid, 0x42, &pull0);
++	(void)sweet_pmic_read(ppid, 0x45, &out);
++	(void)sweet_pmic_read(ppid, 0x46, &en);
++	/* Already a high output (ABL sets rome_vreg up): leave it as it is. */
++	bool ok = (mode == 0x11 && (en & 0x80)) ||
++	    (sweet_pmic_write(ppid, 0x41, vin) && sweet_pmic_write(ppid, 0x42, pull) &&
++	    sweet_pmic_write(ppid, 0x40, 0x11) && sweet_pmic_write(ppid, 0x46, 0x80));
++	uint8_t after = 0, vin1 = 0;
++	(void)sweet_pmic_read(ppid, 0x40, &after);
++	(void)sweet_pmic_read(ppid, 0x41, &vin1);
++	printf("NATRIUM WLAN: PMIC %s (ppid %#x): mode %#x vin %#x pull %#x out %#x en %#x -> mode %#x vin %#x: %s\n",
++	    name, ppid, mode, vin0, pull0, out, en, after, vin1, ok ? "high" : "WRITE FAILED");
++	return ok;
++}
++
++/*
++ * What the PMIC really has (the RPM acks votes either way): STATUS (0x08),
++ * VOLTAGE_CTL2 (0x41), EN_CTL (0x46) of the WLAN/PCIe rails (PM8994 SID 1,
++ * qcom_spmi-regulator map: S1 0x1400 + 0x300 n, L1 0x4000 + 0x100 n) and of
++ * the clock buffer peripherals (SID 0, 0x5000-0x5500).
++ */
++static void
++wl_pmic_dump(const char *when)
++{
++	static const struct { const char *name; uint16_t ppid; } p[] = {
++		{"S3", 0x11a}, {"S4", 0x11d}, {"L12", 0x14b}, {"L28", 0x15b}, {"L30", 0x15d},
++		{"clk50", 0x050}, {"clk51", 0x051}, {"clk52", 0x052}, {"clk53", 0x053},
++		{"clk54", 0x054}, {"clk55", 0x055},
++		{"gpio8", 0x0c7}, {"gpio9", 0x0c8}, {"gpio18", 0x0d1},
++	};
++	for (unsigned i = 0; i < sizeof(p) / sizeof(p[0]); i++) {
++		uint8_t type = 0, sub = 0, st = 0, v = 0, en = 0, mode = 0;
++		bool ok = sweet_pmic_read(p[i].ppid, 0x04, &type);
++		(void)sweet_pmic_read(p[i].ppid, 0x05, &sub);
++		(void)sweet_pmic_read(p[i].ppid, 0x08, &st);
++		(void)sweet_pmic_read(p[i].ppid, 0x41, &v);
++		(void)sweet_pmic_read(p[i].ppid, 0x46, &en);
++		(void)sweet_pmic_read(p[i].ppid, 0x45, &mode);
++		/* GPIOs: status bit 0 = the level on the pin, 0x41 = VIN */
++		printf("NATRIUM WLAN: pmic %s %s (ppid %#x): type %#x/%#x status %#x vset %#x mode %#x en %#x%s\n", when,
++		    p[i].name, p[i].ppid, type, sub, st, v, mode, en, ok ? "" : " (read failed)");
++	}
++}
++
++/* Register dump in pci-msm's layout (8 words a line), to diff against Linux's. */
++static void
++wl_dump(const char *name, vm_offset_t base, uint32_t size)
++{
++	for (uint32_t o = 0; o < size; o += 32) {
++		uint32_t v[8];
++		bool any = false;
++		for (int i = 0; i < 8; i++) {
++			v[i] = rd(base, o + 4 * i);
++			any |= v[i] != 0;
++		}
++		if (any) {
++			printf("NATRIUM WLAN: D %s 0x%04x %08x %08x %08x %08x %08x %08x %08x %08x\n", name, o,
++			    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++		}
++	}
++	sweet_log_kick();
++}
++
++/* Every PM8994 rail (SID 1): S1-S12 at 0x1400 + 0x300 n, L1-L32 at 0x4000 + 0x100 n, LVS1/2 0x8000/0x8100. */
++static void
++wl_rails_dump(void)
++{
++	char line[512];
++	int n = 0;
++	for (unsigned i = 0; i < 12 + 32 + 2; i++) {
++		uint16_t ppid = i < 12 ? (uint16_t)(0x114 + 3 * i) : i < 44 ? (uint16_t)(0x140 + (i - 12)) : (uint16_t)(0x180 + (i - 44));
++		uint8_t st = 0, en = 0, mode = 0;
++		bool ok = sweet_pmic_read(ppid, 0x08, &st);
++		(void)sweet_pmic_read(ppid, 0x46, &en);
++		(void)sweet_pmic_read(ppid, 0x45, &mode);
++		char name[8];
++		snprintf(name, sizeof(name), i < 12 ? "S%u" : i < 44 ? "L%u" : "LVS%u",
++		    i < 12 ? i + 1 : i < 44 ? i - 11 : i - 43);
++		n += snprintf(line + n, sizeof(line) - n, " %s=%s%02x/%02x", name, ok ? "" : "?", st, mode);
++		if (n > 400 || i == 45) {
++			printf("NATRIUM WLAN: rails%s\n", line);
++			n = 0;
++		}
++	}
++}
++
++static void
++wl_phy_common(void)
++{
++	static const uint16_t seq[][2] = {
++		{PCIE_COM_POWER_DOWN_CONTROL, 0x01},
++		{0x034, 0x1c},  /* BIAS_EN_CLKBUFLR_EN */
++		{0x038, 0x10},  /* CLK_ENABLE1 */
++		{0x174, 0x33},  /* CLK_SELECT */
++		{0x194, 0x06},  /* CMN_CONFIG */
++		{0x0c8, 0x42},  /* LOCK_CMP_EN */
++		{0x128, 0x00},  /* VCO_TUNE_MAP */
++		{0x144, 0xff},  /* VCO_TUNE_TIMER1 */
++		{0x148, 0x1f},  /* VCO_TUNE_TIMER2 */
++		{0x178, 0x01},  /* HSCLK_SEL */
++		{0x19c, 0x01},  /* SVS_MODE_CLK_SEL */
++		{0x18c, 0x00},  /* CORE_CLK_EN */
++		{0x184, 0x0a},  /* CORECLK_DIV */
++		{0x00c, 0x09},  /* BG_TIMER */
++		{0x0d0, 0x82},  /* DEC_START_MODE0 */
++		{0x0e4, 0x03},  /* DIV_FRAC_START3_MODE0 */
++		{0x0e0, 0x55},  /* DIV_FRAC_START2_MODE0 */
++		{0x0dc, 0x55},  /* DIV_FRAC_START1_MODE0 */
++		{0x054, 0x00},  /* LOCK_CMP3_MODE0 */
++		{0x050, 0x1a},  /* LOCK_CMP2_MODE0 */
++		{0x04c, 0x0a},  /* LOCK_CMP1_MODE0 */
++		{0x174, 0x33},  /* CLK_SELECT */
++		{0x03c, 0x02},  /* SYS_CLK_CTRL */
++		{0x040, 0x1f},  /* SYSCLK_BUF_ENABLE */
++		{0x0ac, 0x04},  /* SYSCLK_EN_SEL */
++		{0x078, 0x0b},  /* CP_CTRL_MODE0 */
++		{0x084, 0x16},  /* PLL_RCTRL_MODE0 */
++		{0x090, 0x28},  /* PLL_CCTRL_MODE0 */
++		{0x10c, 0x00},  /* INTEGLOOP_GAIN1_MODE0 */
++		{0x108, 0x80},  /* INTEGLOOP_GAIN0_MODE0 */
++		{0x010, 0x01},  /* SSC_EN_CENTER */
++		{0x01c, 0x31},  /* SSC_PER1 */
++		{0x020, 0x01},  /* SSC_PER2 */
++		{0x014, 0x02},  /* SSC_ADJ_PER1 */
++		{0x018, 0x00},  /* SSC_ADJ_PER2 */
++		{0x024, 0x2f},  /* SSC_STEP_SIZE1 */
++		{0x028, 0x19},  /* SSC_STEP_SIZE2 */
++		{0x0c4, 0x15},  /* RESCODE_DIV_NUM */
++		{0x070, 0x0f},  /* BG_TRIM */
++		{0x048, 0x0f},  /* PLL_IVCO */
++		{0x074, 0x19},  /* CLK_EP_DIV */
++		{0x038, 0x10},  /* CLK_ENABLE1 */
++		{0x178, 0x00},  /* HSCLK_SEL (phy-ver 3) */
++		{0x0c4, 0x40},  /* RESCODE_DIV_NUM (phy-ver 3) */
++		{PCIE_COM_SW_RESET, 0x00},
++		{PCIE_COM_START_CONTROL, 0x03},
++	};
++	for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
++		wr(wl_phy, seq[i][0], seq[i][1]);
++	}
++}
++
++static void
++wl_phy_port(void)
++{
++	static const uint16_t seq[][2] = {
++		{TX_ + 0x068, 0x45},    /* HIGHZ_TRANSCEIVEREN_BIAS_DRVR_EN */
++		{TX_ + 0x094, 0x06},    /* LANE_MODE */
++		{RX_ + 0x110, 0x1c},    /* SIGDET_ENABLES */
++		{RX_ + 0x118, 0x17},    /* SIGDET_LVL */
++		{RX_ + 0x0d8, 0x01},    /* RX_EQU_ADAPTOR_CNTRL2 */
++		{RX_ + 0x0dc, 0x00},    /* RX_EQU_ADAPTOR_CNTRL3 */
++		{RX_ + 0x0e0, 0xdb},    /* RX_EQU_ADAPTOR_CNTRL4 */
++		{RX_ + 0x120, 0x18},    /* RX_BAND */
++		{RX_ + 0x01c, 0x04},    /* UCDR_SO_GAIN */
++		{RX_ + 0x010, 0x04},    /* UCDR_SO_GAIN_HALF */
++		{PCS_ + 0x058, 0x4c},   /* RX_IDLE_DTCT_CNTRL */
++		{PCS_ + 0x0a0, 0x00},   /* PWRUP_RESET_DLY_TIME_AUXCLK */
++		{PCS_ + 0x0a4, 0x01},   /* LP_WAKEUP_DLY_TIME_AUXCLK */
++		{PCS_ + 0x0a8, 0x05},   /* PLL_LOCK_CHK_DLY_TIME */
++		{RX_ + 0x048, 0x4b},    /* UCDR_SO_SATURATION_AND_ENABLE */
++		{RX_ + 0x11c, 0x14},    /* SIGDET_DEGLITCH_CNTRL */
++		{PCS_ + 0x054, 0x05},   /* ENDPOINT_REFCLK_DRIVE */
++		{PCS_ + 0x004, 0x02},   /* POWER_DOWN_CONTROL */
++		{PCS_ + 0x06c, 0x00},   /* POWER_STATE_CONFIG4 */
++		{PCS_ + 0x060, 0xa3},   /* POWER_STATE_CONFIG1 */
++		{RX_ + 0x118, 0x19},    /* SIGDET_LVL (phy-ver 3) */
++		{PCS_ + 0x028, 0x0e},   /* TXDEEMPH_M3P5DB_V0 (phy-ver 3) */
++		{PCS_ + 0x004, 0x03},   /* POWER_DOWN_CONTROL */
++	};
++	for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
++		wr(wl_phy, seq[i][0], seq[i][1]);
++	}
++	delay(20);
++	wr(wl_phy, PCS_ + 0x000, 0x00);         /* SW_RESET */
++	wr(wl_phy, PCS_ + 0x008, 0x0a);         /* START_CONTROL */
++}
++
++static bool
++wl_bringup(void)
++{
++	wl_gcc = wl_map(WL_GCC_PA, 0x90000);
++	wl_parf = wl_map(WL_PARF_PA, 0x2000);
++	wl_phy = wl_map(WL_PHY_PA, 0x4000);
++	wl_dbi = wl_map(WL_DBI_PA, 0x1000);
++	wl_conf = wl_map(WL_CONF_PA, 0x1000);
++	wl_perst = wl_map(WL_TLMM_PA + 0x1000u * WL_GPIO_PERST, 0x1000);
++	wl_boot = wl_map(WL_TLMM_PA + 0x1000u * WL_GPIO_BOOT, 0x1000);
++	wl_clkreq = wl_map(WL_TLMM_PA + 0x1000u * WL_GPIO_CLKREQ, 0x1000);
++	wl_wake = wl_map(WL_TLMM_PA + 0x1000u * WL_GPIO_WAKE, 0x1000);
++	if (!wl_gcc || !wl_parf || !wl_phy || !wl_dbi || !wl_conf || !wl_perst || !wl_boot || !wl_clkreq || !wl_wake) {
++		printf("NATRIUM WLAN: mapping failed\n");
++		return false;
++	}
++	/* Only TLMM and GCC here: PARF/PHY/DBI hang the bus until their clocks run. */
++	printf("NATRIUM WLAN: before: perst cfg %#x io %#x, boot cfg %#x io %#x, gdsc pcie0 %#x aggre0 %#x\n",
++	    rd(wl_perst, 0), rd(wl_perst, 4), rd(wl_boot, 0), rd(wl_boot, 4),
++	    rd(wl_gcc, GCC_PCIE_0_GDSCR), rd(wl_gcc, GCC_AGGRE0_NOC_GDSCR));
++	wl_step("rails");
++
++	/* PCIe endpoint held in reset while everything powers up; CLKREQ# and WAKE# as in pcie0 pinctrl "default". */
++	wl_tlmm_out(wl_perst, 0, 2, 1);
++	wr(wl_clkreq, 0, (1u << 2) | 3u);       /* pci_e0, 2 mA, pull-up */
++	wr(wl_wake, 0, 3u);                     /* GPIO input, 2 mA, pull-up */
++	printf("NATRIUM WLAN: clkreq cfg %#x, wake cfg %#x\n", rd(wl_clkreq, 0), rd(wl_wake, 0));
++	wl_msleep(1);
++
++	wl_pmic_dump("before");
++	/* Rails and the reference clock. */
++	(void)sweet_rpm_smpa(3, 1300000);       /* vdd-wlan-core */
++	(void)sweet_rpm_smpa(4, 1800000);       /* vdd-wlan-io */
++	delay(1000);
++	/*
++	 * WLAN xtal, in high-power mode: a vote without a load put L30 into LPM
++	 * (0169p: mode 0x80 -> 0), and the chip's crystal with it.
++	 */
++	(void)sweet_rpm_ldoa_load(30, 1800000, 30);
++	(void)sweet_rpm_cx_corner(7);           /* vreg-cx: PCIe logic (Linux: 4..7) */
++	/* With Linux's loads (pci-msm vreg-1.8 14 mA, DT vreg-0.9 24 mA): high-power mode. */
++	(void)sweet_rpm_ldoa_load(12, 1800000, 14);     /* PCIe PHY 1.8 V */
++	(void)sweet_rpm_ldoa_load(28, 925000, 24);      /* PCIe PHY 0.9 V */
++	(void)sweet_rpm_xo_buffer(8);           /* LN_BB_CLK */
++
++	/* The chip: vdd-wlan, sleep clock, bootstrap, WLAN_EN. */
++	wl_step("chip power");
++	{
++		/* DT gpio@d100: output, vin-sel 2, src-sel 3 (func2 = SLEEP_CLK2), out-strength 2, CMOS */
++		uint8_t m = 0, v = 0, o = 0, e = 0;
++		(void)sweet_pmic_read(WL_PMIC_SLEEP, 0x40, &m);
++		(void)sweet_pmic_read(WL_PMIC_SLEEP, 0x41, &v);
++		(void)sweet_pmic_read(WL_PMIC_SLEEP, 0x45, &o);
++		(void)sweet_pmic_read(WL_PMIC_SLEEP, 0x46, &e);
++		bool ok = sweet_pmic_write(WL_PMIC_SLEEP, 0x41, 2) && sweet_pmic_write(WL_PMIC_SLEEP, 0x45, 0x02) &&
++		    sweet_pmic_write(WL_PMIC_SLEEP, 0x40, (1u << 4) | (3u << 1)) && sweet_pmic_write(WL_PMIC_SLEEP, 0x46, 0x80);
++		uint8_t m2 = 0;
++		(void)sweet_pmic_read(WL_PMIC_SLEEP, 0x40, &m2);
++		printf("NATRIUM WLAN: PMIC sleep_clk (ppid %#x): mode %#x vin %#x out %#x en %#x -> mode %#x: %s\n",
++		    WL_PMIC_SLEEP, m, v, o, e, m2, ok ? "on" : "WRITE FAILED");
++	}
++	/*
++	 * A clean reset of the chip first. Linux's qpnp-pin applies the DT at
++	 * ~0.5 s, so WLAN_EN is a driven-low output long before cnss raises it
++	 * (TWRP: link up at 3.2 s). ABL leaves it an input with a 10 uA
++	 * pull-down while vdd-wlan is already on: hold it (and bootstrap) low.
++	 */
++	{
++		/* BT half of the combo chip held off, as Linux (DT gpio@d200: output low, vin 2, pull 4). */
++		uint8_t bm = 0, bv = 0, be = 0;
++		(void)sweet_pmic_read(WL_PMIC_BT_EN, 0x40, &bm);
++		(void)sweet_pmic_read(WL_PMIC_BT_EN, 0x41, &bv);
++		(void)sweet_pmic_read(WL_PMIC_BT_EN, 0x46, &be);
++		bool bt = sweet_pmic_write(WL_PMIC_BT_EN, 0x41, 2) && sweet_pmic_write(WL_PMIC_BT_EN, 0x42, 4) &&
++		    sweet_pmic_write(WL_PMIC_BT_EN, 0x40, 0x10) && sweet_pmic_write(WL_PMIC_BT_EN, 0x46, 0x80);
++		printf("NATRIUM WLAN: BT_EN (ppid %#x) mode %#x vin %#x en %#x -> held low: %s\n",
++		    WL_PMIC_BT_EN, bm, bv, be, bt ? "ok" : "WRITE FAILED");
++		/* TWRP (link up): vdd-wlan was off and came on just before WLAN_EN: power-cycle it. */
++		bool ok = sweet_pmic_write(WL_PMIC_EN, 0x41, 2) && sweet_pmic_write(WL_PMIC_EN, 0x42, 4) &&
++		    sweet_pmic_write(WL_PMIC_EN, 0x40, 0x10) && sweet_pmic_write(WL_PMIC_EN, 0x46, 0x80) &&
++		    sweet_pmic_write(WL_PMIC_ROME, 0x41, 0) && sweet_pmic_write(WL_PMIC_ROME, 0x40, 0x10);
++		wl_tlmm_out(wl_boot, 0, 16, 1);
++		printf("NATRIUM WLAN: vdd-wlan, wlan_en and bootstrap held low: %s\n", ok ? "ok" : "WRITE FAILED");
++		wl_msleep(100);
++		ok = sweet_pmic_write(WL_PMIC_ROME, 0x40, 0x11);        /* DT gpio@c800: vin 0, high */
++		printf("NATRIUM WLAN: vdd-wlan (rome_vreg) on: %s\n", ok ? "ok" : "WRITE FAILED");
++		wl_msleep(10);                  /* startup-delay-us 4000 */
++	}
++	/* TWRP order: vdd-wlan on, WLAN_EN on, then the whole PCIe enable, then PERST. */
++	printf("NATRIUM WLAN: chip in reset: clkreq in %u, wake in %u\n", rd(wl_clkreq, 4) & 1u, rd(wl_wake, 4) & 1u);
++	wl_tlmm_out(wl_boot, 1, 16, 1);         /* cnss_default: gpio, pull-down, driven high */
++	wl_msleep(10);
++	if (!wl_pmic_gpio_high("wlan_en", WL_PMIC_EN, 2, 4)) {      /* DT: vin-sel 2 (1.8 V), pull 4 (down) */
++		return false;
++	}
++	wl_msleep(60);
++	wl_fast = true;
++	/* The chip stays in reset until the PCIe side is ready (see below). */
++
++	/* Power domains, clocks, resets. */
++	wl_step("gdsc + clocks");
++	if (!wl_gdsc("aggre0_noc", GCC_AGGRE0_NOC_GDSCR) || !wl_gdsc("pcie_0", GCC_PCIE_0_GDSCR)) {
++		return false;
++	}
++	(void)wl_branch("aggre0_snoc_axi", GCC_AGGRE0_SNOC_AXI_CBCR, true);
++	(void)wl_branch("aggre0_cnoc_ahb", GCC_AGGRE0_CNOC_AHB_CBCR, true);
++	(void)wl_branch("smmu_aggre0_axi", GCC_SMMU_AGGRE0_AXI_CBCR, true);
++	(void)wl_branch("smmu_aggre0_ahb", GCC_SMMU_AGGRE0_AHB_CBCR, true);
++	/* aux 1.0105 MHz = XO / 19: RCG MND, src 0 (XO), hid div 1, M 1, N 19, dual edge */
++	wr(wl_gcc, GCC_PCIE_AUX_CMD_RCGR + 0x8, 1);                      /* M */
++	wr(wl_gcc, GCC_PCIE_AUX_CMD_RCGR + 0xc, ~(19u - 1u));             /* N: ~(n - m) */
++	wr(wl_gcc, GCC_PCIE_AUX_CMD_RCGR + 0x10, ~19u);                   /* D: ~n (50 %) */
++	wr(wl_gcc, GCC_PCIE_AUX_CMD_RCGR + 0x4, (2u << 12) | (0u << 8) | 1u);   /* CFG */
++	wr(wl_gcc, GCC_PCIE_AUX_CMD_RCGR, rd(wl_gcc, GCC_PCIE_AUX_CMD_RCGR) | 1u);
++	for (int i = 0; i < 100 && (rd(wl_gcc, GCC_PCIE_AUX_CMD_RCGR) & 1u); i++) {
++		delay(5);
++	}
++	bool clk = wl_branch("pcie_0_aux", GCC_PCIE_0_AUX_CBCR, true);
++	clk &= wl_branch("pcie_0_cfg_ahb", GCC_PCIE_0_CFG_AHB_CBCR, true);
++	clk &= wl_branch("pcie_0_mstr_axi", GCC_PCIE_0_MSTR_AXI_CBCR, true);
++	clk &= wl_branch("pcie_0_slv_axi", GCC_PCIE_0_SLV_AXI_CBCR, true);
++	clk &= wl_branch("pcie_phy_cfg_ahb", GCC_PCIE_PHY_CFG_AHB_CBCR, true);
++	clk &= wl_branch("pcie_phy_aux", GCC_PCIE_PHY_AUX_CBCR, true);
++	(void)wl_branch("pcie_clkref", GCC_PCIE_CLKREF_EN, false);
++	if (!clk) {
++		return false;
++	}
++	/* PHY resets pulsed (mainline qcom_qmp: assert, then deassert). */
++	printf("NATRIUM WLAN: BCRs phy %#x com %#x nocsr %#x lane %#x, clkref %#x\n",
++	    rd(wl_gcc, GCC_PCIE_PHY_BCR), rd(wl_gcc, GCC_PCIE_PHY_COM_BCR),
++	    rd(wl_gcc, GCC_PCIE_PHY_NOCSR_COM_PHY_BCR), rd(wl_gcc, GCC_PCIE_0_PHY_BCR), rd(wl_gcc, GCC_PCIE_CLKREF_EN));
++	wr(wl_gcc, GCC_PCIE_PHY_BCR, 1);
++	wr(wl_gcc, GCC_PCIE_PHY_COM_BCR, 1);
++	wr(wl_gcc, GCC_PCIE_PHY_NOCSR_COM_PHY_BCR, 1);
++	wr(wl_gcc, GCC_PCIE_0_PHY_BCR, 1);
++	wl_msleep(1);
++	wr(wl_gcc, GCC_PCIE_PHY_BCR, 0);
++	wr(wl_gcc, GCC_PCIE_PHY_COM_BCR, 0);
++	wr(wl_gcc, GCC_PCIE_PHY_NOCSR_COM_PHY_BCR, 0);
++	wl_msleep(1);
++
++	/* Controller glue. */
++	wl_step("parf");
++	wr(wl_parf, PARF_PHY_CTRL, rd(wl_parf, PARF_PHY_CTRL) & ~1u);
++	wr(wl_parf, PARF_DBI_BASE_ADDR, 0);
++	wr(wl_parf, PARF_SYS_CTRL, 0x365e);
++	wr(wl_parf, PARF_MHI_CLOCK_RESET_CTRL, rd(wl_parf, PARF_MHI_CLOCK_RESET_CTRL) | (1u << 4));
++	wr(wl_parf, PARF_SLV_ADDR_SPACE_SIZE, 16u << 20);       /* bars 0xc300000 + 13 MB */
++
++	/* PHY, pipe clock (comes from the PHY), PHY ready. */
++	wl_step("phy");
++	wl_phy_common();
++	wl_msleep(1);
++	wr(wl_gcc, GCC_PCIE_0_PHY_BCR, 0);
++	(void)wl_branch("pcie_0_pipe", GCC_PCIE_0_PIPE_CBCR, false);
++	bool ready = false;
++	for (int i = 0; i < 10 && !ready; i++) {
++		ready = (rd(wl_phy, PCIE_COM_PCS_READY_STATUS) & 1u) != 0;
++		if (!ready) {
++			wl_msleep(1);
++		}
++	}
++	printf("NATRIUM WLAN: PHY %s (ready %#x, pipe cbcr %#x, C_READY %#x)\n", ready ? "ready" : "NOT READY",
++	    rd(wl_phy, PCIE_COM_PCS_READY_STATUS), rd(wl_gcc, GCC_PCIE_0_PIPE_CBCR), rd(wl_phy, 0x190));
++	if (!ready) {
++		return false;
++	}
++	wl_phy_port();
++	/* Lane up: PCS_STATUS PHYSTATUS (bit 6) clears once the pipe clock runs (mainline qmp power_on). */
++	uint32_t pcs = 0;
++	for (int i = 0; i < 100; i++) {
++		pcs = rd(wl_phy, PCS_ + 0x174);
++		if (!(pcs & (1u << 6))) {
++			break;
++		}
++		delay(100);
++	}
++	printf("NATRIUM WLAN: lane %s (pcs status %#x, pipe cbcr %#x, com ready %#x)\n",
++	    (pcs & (1u << 6)) ? "NOT UP" : "up", pcs, rd(wl_gcc, GCC_PCIE_0_PIPE_CBCR), rd(wl_phy, PCIE_COM_PCS_READY_STATUS));
++	/*
++	 * Now the chip, then PERST, as quickly as cnss + pci-msm do it (TWRP:
++	 * WLAN_EN high -> PERST release ~25 ms): the PCIe side is ready first.
++	 */
++	wl_pmic_dump("at link");
++	wl_rails_dump();
++	wl_step("chip on + link");
++	{
++		uint8_t s8 = 0, s9 = 0;
++		(void)sweet_pmic_read(WL_PMIC_EN, 0x08, &s8);
++		(void)sweet_pmic_read(WL_PMIC_ROME, 0x08, &s9);
++		printf("NATRIUM WLAN: chip on: wlan_en pin status %#x, rome_vreg pin status %#x, clkreq in %u\n",
++		    s8, s9, rd(wl_clkreq, 4) & 1u);
++	}
++	wl_msleep(10);                          /* qcom,ep-latency */
++
++	/* Endpoint out of reset, link training. */
++	wl_tlmm_out(wl_perst, 1, 2, 1);
++	wl_msleep(1);
++	wr(wl_dbi, DBI_DEVICE_CONTROL_STATUS,
++	    (rd(wl_dbi, DBI_DEVICE_CONTROL_STATUS) & ~0x7000u) | (5u << 12));      /* max read 4 KB */
++	wr(wl_parf, PARF_LTSSM, rd(wl_parf, PARF_LTSSM) | (1u << 8));
++	uint32_t sts = 0, lnk = 0, ltssm = 0xff, seen = 0;
++	bool up = false;
++	for (int i = 0; i < 1000 && !up; i++) {         /* 1 s, like mainline dw_pcie_wait_for_link */
++		delay(1000);
++		sts = rd(wl_dbi, ELBI_SYS_STTS);
++		lnk = rd(wl_dbi, DBI_LINK_STATUS);
++		up = (sts & XMLH_LINK_UP) && (lnk & (1u << 29));
++		uint32_t st = rd(wl_dbi, 0x728) & 0x3fu;        /* PORT_DEBUG0: LTSSM state */
++		if (st != ltssm && seen++ < 24) {
++			printf("NATRIUM WLAN: LTSSM %#x at %d ms (debug1 %#x, clkreq in %u, wake in %u)\n", st, i,
++			    rd(wl_dbi, 0x72c), (rd(wl_clkreq, 4) & 1u), (rd(wl_wake, 4) & 1u));
++		}
++		ltssm = st;
++	}
++	printf("NATRIUM WLAN: link %s after PERST (elbi %#x, link status %#x, ltssm %#x, rc id %#x, perst io %#x, pcs status %#x, pipe cbcr %#x)\n",
++	    up ? "UP" : "DOWN", sts, lnk, rd(wl_parf, PARF_LTSSM), rd(wl_dbi, 0), rd(wl_perst, 4),
++	    rd(wl_phy, PCS_ + 0x174), rd(wl_gcc, GCC_PCIE_0_PIPE_CBCR));
++	if (!up) {
++		wl_dump("parf", wl_parf, 0x260);
++		wl_dump("phy", wl_phy, 0x1800);
++		wl_dump("dbi", wl_dbi, 0xf00);
++		return false;
++	}
++
++	wl_step("config space");
++	/* iATU region 0: CFG0 accesses to bus 1, device 0 through the conf window. */
++	wr(wl_dbi, DBI_IATU_VIEWPORT, 0);
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x8, 0);                 /* CTRL2: off */
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x4, 0x04);              /* CTRL1: CFG0 */
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0xc, WL_CONF_PA);        /* LBAR */
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x10, 0);                /* UBAR */
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x14, WL_CONF_PA + 0xfff);       /* LAR */
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x18, 1u << 24);         /* LTAR: bus 1 */
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x1c, 0);                /* UTAR */
++	wr(wl_dbi, DBI_IATU_VIEWPORT + 0x8, 1u << 31);          /* enable */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t id = rd(wl_conf, 0), rev = rd(wl_conf, 8);
++	printf("NATRIUM WLAN: endpoint id %#x class/rev %#x bar0 %#x%s\n", id, rev, rd(wl_conf, 0x10),
++	    id == 0x003e168cu ? " = QCA6174" : "");
++	return id == 0x003e168cu;
++}
++
++static void
++wl_thread(__unused void *arg, __unused wait_result_t wr_)
++{
++	wl_msleep(20000);       /* after boot: the log thread runs, iOS is up */
++	bool ok = wl_bringup();
++	printf("NATRIUM WLAN: stage 1 %s\n", ok ? "done: QCA6174 on PCIe" : "FAILED");
++	thread_terminate(current_thread());
++}
++
++void
++natrium_wlan_init(void)
++{
++	int on = 0;
++	thread_t thread;
++	(void)PE_parse_boot_argn("natriumwlan", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	if (kernel_thread_start(wl_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

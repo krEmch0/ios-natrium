@@ -1,0 +1,429 @@
+--- a/bsd/dev/natrium_wlan.c
++++ b/bsd/dev/natrium_wlan.c
+@@ -580,7 +580,7 @@
+  */
+ #define WL_BAR_PA       0x0c400000u     /* BAR0 (2 MB) in RC0's memory window 0xc300000 + 13 MB */
+ #define WL_DMA_PA       0xa0000000u     /* low-bank DRAM: not XNU's (upper bank), no carve-out, < 4 GB (CE addresses are 32-bit) */
+-#define WL_DMA_SIZE     0x20000u
++#define WL_DMA_SIZE     0x400000u       /* rings, buffers, then the firmware's host memory from D_HOSTMEM */
+ #define WL_SMMU_PA      0x01640000u     /* anoc0 SMMU (pcie0 iommus) */
+ 
+ /* QCA6174 BAR0 (ath10k hw.c qca6174_regs = qcacld ar6320v2def.h) */
+@@ -628,17 +628,25 @@
+ #define D_REQ           0x1000u
+ #define D_RESP          0x1400u
+ #define D_DIAG          0x2000u         /* 2 KB */
+-#define D_RX            0x4000u         /* 15 x 2 KB, CE 1 after BMI */
++#define D_CE2_DST       0x0800u         /* 16 */
++#define D_CE3_SRC       0x0900u         /* 16 */
++#define D_RX1           0x10000u        /* 14 x 2 KB, CE 1 (HTC control, HTT) */
++#define D_RX2           0x18000u        /* 14 x 2 KB, CE 2 (WMI events) */
++#define D_TX            0x20000u        /* 2 KB per CE 0 / CE 3 send, synchronous */
++#define D_HOSTMEM       0x100000u       /* firmware memory requests (WMI init), up to 3 MB */
+ 
+ static vm_offset_t wl_bar, wl_dma, wl_smmu;
+ 
+ struct wl_ce {
+ 	uint32_t reg, src, dst, mask;   /* BAR offset, ring offsets in the DMA area, entries - 1 */
+ 	uint32_t swr, dwr, drd;         /* src write index, dst write and read index */
++	uint32_t buf[16];               /* DMA offset of the rx buffer posted in each dst slot */
+ };
+ static struct wl_ce ce0 = { Q_CE(0), D_CE0_SRC, 0, 15 };
+ static struct wl_ce ce1 = { Q_CE(1), 0, D_CE1_DST, 15 };
+ static struct wl_ce ce7 = { Q_CE(7), D_CE7_SRC, D_CE7_DST, 1 };
++static struct wl_ce ce2 = { Q_CE(2), 0, D_CE2_DST, 15 };
++static struct wl_ce ce3 = { Q_CE(3), D_CE3_SRC, 0, 15 };
+ 
+ static void
+ wl_ce_init(struct wl_ce *c, uint32_t dmax)
+@@ -698,7 +706,26 @@
+ 	return n;
+ }
+ 
++/* Post the 2 KB rx buffer at DMA offset off into c's next dst slot. */
+ static void
++wl_rx_post(struct wl_ce *c, uint32_t off)
++{
++	c->buf[c->dwr] = off;
++	wl_ce_post(c, WL_DMA_PA + off);
++}
++
++/* Next completed rx buffer of c: bytes (0 if none) and its DMA offset; repost it after use. */
++static uint32_t
++wl_rx_get(struct wl_ce *c, uint32_t *off)
++{
++	uint32_t slot = c->drd, n = wl_ce_recv(c);
++	if (n) {
++		*off = c->buf[slot];
++	}
++	return n;
++}
++
++static void
+ wl_smmu_dump(const char *when)
+ {
+ 	uint32_t idr0 = rd(wl_smmu, 0x20);
+@@ -1132,6 +1159,9 @@
+ 	return true;
+ }
+ 
++static uint32_t wl_credits, wl_credit_size;     /* HTC tx credits (WMI control endpoint) */
++static uint8_t wl_htc_poll(uint32_t ms);
++
+ static bool
+ wl_stage2(void)
+ {
+@@ -1215,6 +1245,8 @@
+ 	wl_ce_init(&ce0, 256);
+ 	wl_ce_init(&ce1, 2048);
+ 	wl_ce_init(&ce7, 2048);
++	wl_ce_init(&ce2, 2048);
++	wl_ce_init(&ce3, 2048);
+ 	if (!wl_early_config(chip)) {
+ 		return false;
+ 	}
+@@ -1328,21 +1360,27 @@
+ 	}
+ 
+ 	wl_step("bmi done");
+-	for (uint32_t i = 0; i < 14; i++) {    /* HTC READY lands here: posted before BMI_DONE */
+-		wl_ce_post(&ce1, WL_DMA_PA + D_RX + 2048 * i);
++	for (uint32_t i = 0; i < 14; i++) {    /* HTC READY lands in CE 1: posted before BMI_DONE */
++		wl_rx_post(&ce1, D_RX1 + 2048 * i);
++		wl_rx_post(&ce2, D_RX2 + 2048 * i);
+ 	}
+ 	wl_q[0] = 1;
+ 	if (!wl_bmi(4, 0)) {
+ 		return false;
+ 	}
+-	uint32_t n = 0;
++	uint32_t n = 0, off = 0;
+ 	for (int i = 0; i < 5000 && !n; i++) {
+-		n = wl_ce_recv(&ce1);
++		n = wl_rx_get(&ce1, &off);
+ 		if (!n) {
+ 			wl_msleep(1);
+ 		}
+ 	}
+-	const volatile uint32_t *m = (const volatile uint32_t *)(wl_dma + D_RX);
++	const volatile uint32_t *m = (const volatile uint32_t *)(wl_dma + off);
++	if (n) {
++		wl_credits = ((const volatile uint16_t *)m)[5];        /* READY: credit count */
++		wl_credit_size = ((const volatile uint16_t *)m)[6];
++		wl_rx_post(&ce1, off);
++	}
+ 	printf("NATRIUM WLAN: after BMI_DONE: fw_ind %#x, CE1 message %u bytes: %08x %08x %08x %08x %08x %08x\n",
+ 	    rd(wl_bar, Q_FW_IND), n, m[0], m[1], m[2], m[3], m[4], m[5]);
+ 	if (!n) {
+@@ -1362,8 +1400,300 @@
+ 		sweet_log_kick();
+ 	}
+ 	return n != 0;
++}
++
++/*
++ * Stage 3: HTC and WMI (ath10k htc.c / wmi-tlv.c; this firmware's WMI-TLV
++ * structures and tags from qcacld-2.0 wmi_unified.h, wmi_tlv_defs.h).
++ * HTC frames: 8-byte header {eid, flags, len, trailer len / seq, pad}, then
++ * the payload; rx trailers carry credit reports. Endpoint 0 = HTC control
++ * (CE 0 out, CE 1 in), WMI control = CE 3 out, CE 2 in. WMI: 4-byte header
++ * (command/event id), then TLVs {len:16, tag:16}.
++ */
++#define HTC_EP_CTRL             0
++#define WMI_INIT_CMDID          0x0001u
++#define WMI_SERVICE_READY_EVTID 0x0001u
++#define WMI_READY_EVTID         0x0002u
++#define TAG_ARRAY_STRUC         0x12u
++#define TAG_INIT_CMD            0x4au
++#define TAG_RESOURCE_CONFIG     0x4bu
++#define TAG_HOST_MEM_CHUNK      0x4cu
++#define TAG_SERVICE_READY       0x20u
++#define TAG_HOST_MEM_REQ        0x22u
++#define TAG_READY               0x23u
++
++static uint8_t wl_wmi_ep = 0xff, wl_seq[8];
++
++/* Send an HTC frame (payload already at D_TX + 8 + CE slot) on eid through CE c. */
++static bool
++wl_htc_send(struct wl_ce *c, uint8_t eid, uint32_t len)
++{
++	uint32_t off = D_TX + (c == &ce3 ? 0x800u : 0);
++	volatile uint8_t *h = (volatile uint8_t *)(wl_dma + off);
++	if (eid == wl_wmi_ep) {
++		for (int i = 0; i < 2000 && !wl_credits; i++) {
++			(void)wl_htc_poll(1);   /* credit reports come back in rx trailers */
++		}
++		if (!wl_credits) {
++			printf("NATRIUM WLAN: HTC: no credits for ep %u\n", eid);
++			return false;
++		}
++		wl_credits--;
++	}
++	h[0] = eid;
++	h[1] = eid == wl_wmi_ep ? 1 : 0;        /* NEED_CREDIT_UPDATE */
++	h[2] = len & 0xff;
++	h[3] = len >> 8;
++	h[4] = 0;
++	h[5] = wl_seq[eid & 7]++;
++	h[6] = h[7] = 0;
++	wl_ce_send(c, WL_DMA_PA + off, len + 8, (uint16_t)(eid << 2));
++	uint32_t got = 0;
++	if (!wl_wait(c, NULL, &got, 1000)) {
++		printf("NATRIUM WLAN: HTC send on ep %u FAILED\n", eid);
++		wl_ce_dump("htc tx", c);
++		return false;
++	}
++	return true;
++}
++
++static uint8_t *
++wl_htc_tx_payload(struct wl_ce *c)
++{
++	return (uint8_t *)(wl_dma + D_TX + (c == &ce3 ? 0x800u : 0) + 8);
++}
++
++/* Last received WMI event / HTC control message (copied out of the rx buffer). */
++static uint8_t wl_msg[2048];
++static uint32_t wl_msg_len;
++static uint8_t wl_msg_eid;
++
++/*
++ * Poll CE 1 and CE 2 for up to ms: take one frame, apply its credit
++ * reports, copy the payload to wl_msg, repost the buffer. Returns the
++ * endpoint (0xff: nothing).
++ */
++static uint8_t
++wl_htc_poll(uint32_t ms)
++{
++	for (uint32_t t = 0; t <= ms; t++) {
++		struct wl_ce *cs[2] = { &ce2, &ce1 };
++		for (int k = 0; k < 2; k++) {
++			uint32_t off = 0, n = wl_rx_get(cs[k], &off);
++			if (!n) {
++				continue;
++			}
++			const volatile uint8_t *f = (const volatile uint8_t *)(wl_dma + off);
++			uint32_t len = f[2] | (uint32_t)f[3] << 8, tl = (f[1] & 2) ? f[4] : 0;
++			uint8_t eid = f[0];
++			if (len + 8 > n || tl > len) {
++				printf("NATRIUM WLAN: HTC rx: bad frame (n %u eid %u len %u trailer %u)\n", n, eid, len, tl);
++				wl_rx_post(cs[k], off);
++				continue;
++			}
++			for (uint32_t r = 8 + len - tl; r + 4 <= 8 + len;) {      /* trailer records */
++				uint8_t id = f[r], rl = f[r + 1];
++				if (id == 1) {          /* credit reports: {eid, credits, pad, pad} */
++					for (uint32_t j = 0; j + 4 <= rl; j += 4) {
++						if (f[r + 4 + j] == wl_wmi_ep) {
++							wl_credits += f[r + 4 + j + 1];
++						}
++					}
++				}
++				r += 4 + rl;
++			}
++			wl_msg_len = len - tl;
++			wl_msg_eid = eid;
++			for (uint32_t i = 0; i < wl_msg_len && i < sizeof(wl_msg); i++) {
++				wl_msg[i] = f[8 + i];
++			}
++			wl_rx_post(cs[k], off);
++			if (wl_msg_len) {
++				return eid;
++			}
++		}
++		if (t < ms) {
++			wl_msleep(1);
++		}
++	}
++	return 0xff;
++}
++
++/* HTC CONNECT_SERVICE on endpoint 0; returns the assigned endpoint (0xff on failure). */
++static uint8_t
++wl_htc_connect(uint16_t svc, uint8_t tx_alloc)
++{
++	uint8_t *p = wl_htc_tx_payload(&ce0);
++	uint16_t flags = (uint16_t)(tx_alloc << 8) | (svc == 0x100 ? 0 : (1u << 3));    /* credit flow only for WMI */
++	bzero(p, 8);
++	p[0] = 2;               /* CONNECT_SERVICE */
++	p[2] = svc & 0xff;
++	p[3] = svc >> 8;
++	p[4] = flags & 0xff;
++	p[5] = flags >> 8;
++	if (!wl_htc_send(&ce0, HTC_EP_CTRL, 8)) {
++		return 0xff;
++	}
++	for (int i = 0; i < 20; i++) {
++		if (wl_htc_poll(100) == HTC_EP_CTRL && wl_msg[0] == 3) {
++			uint16_t rsvc = wl_msg[2] | (uint16_t)wl_msg[3] << 8, max = wl_msg[6] | (uint16_t)wl_msg[7] << 8;
++			printf("NATRIUM WLAN: HTC connect %#x: status %u ep %u max msg %u\n", rsvc, wl_msg[4], wl_msg[5], max);
++			return wl_msg[4] == 0 ? wl_msg[5] : 0xff;
++		}
++	}
++	printf("NATRIUM WLAN: HTC connect %#x: no response\n", svc);
++	return 0xff;
+ }
+ 
++/* Wait up to ms for WMI event id; leaves it in wl_msg (after the 4-byte WMI header). */
++static bool
++wl_wmi_wait(uint32_t id, uint32_t ms)
++{
++	for (uint32_t t = 0; t < ms; t += 10) {
++		if (wl_htc_poll(10) == wl_wmi_ep && wl_msg_len >= 4) {
++			uint32_t ev = (wl_msg[0] | (uint32_t)wl_msg[1] << 8 | (uint32_t)wl_msg[2] << 16);
++			if (ev == id) {
++				return true;
++			}
++			printf("NATRIUM WLAN: WMI event %#x (%u bytes)\n", ev, wl_msg_len);
++		}
++	}
++	return false;
++}
++
++static inline uint32_t
++le32(const uint8_t *p)
++{
++	return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint32_t *
++wl_tlv(uint32_t *w, uint32_t tag, uint32_t len)
++{
++	*w = tag << 16 | len;
++	return w + 1;
++}
++
++static bool
++wl_stage3(void)
++{
++	wl_step("htc");
++	printf("NATRIUM WLAN: HTC: %u credits of %u bytes\n", wl_credits, wl_credit_size);
++	uint8_t tx_alloc = (uint8_t)wl_credits;
++	wl_wmi_ep = wl_htc_connect(0x100, tx_alloc);   /* WMI control */
++	if (wl_wmi_ep == 0xff) {
++		return false;
++	}
++	{
++		uint8_t *p = wl_htc_tx_payload(&ce0);       /* SETUP_COMPLETE_EX */
++		bzero(p, 12);
++		p[0] = 5;
++		if (!wl_htc_send(&ce0, HTC_EP_CTRL, 12)) {
++			return false;
++		}
++	}
++
++	wl_step("wmi service ready");
++	if (!wl_wmi_wait(WMI_SERVICE_READY_EVTID, 5000)) {
++		printf("NATRIUM WLAN: no WMI service ready\n");
++		return false;
++	}
++	/* TLVs: fixed param, HAL reg caps, service bitmap, mem_reqs[] (array of TLVs) */
++	uint32_t abi[6] = { 0 }, nreq = 0, req[8][4];
++	for (uint32_t o = 4; o + 4 <= wl_msg_len;) {
++		uint32_t h = le32(&wl_msg[o]), tag = h >> 16, len = h & 0xffff;
++		const uint8_t *v = &wl_msg[o + 4];
++		if (tag == TAG_SERVICE_READY && len >= 4 * 20) {
++			for (int i = 0; i < 6; i++) {
++				abi[i] = le32(v + 4 + 4 * i);
++			}
++			printf("NATRIUM WLAN: service ready: fw build %#x abi %#x/%u phy cap %#x rf chains %u ht %#x vht %#x mem reqs %u max scan chans %u\n",
++			    le32(v), abi[0], abi[1], le32(v + 28), le32(v + 36), le32(v + 40), le32(v + 44), le32(v + 72), le32(v + 76));
++		} else if (tag == TAG_ARRAY_STRUC) {
++			for (uint32_t a = 0; a + 4 <= len;) {
++				uint32_t eh = le32(v + a), et = eh >> 16, el = eh & 0xffff;
++				if (et == TAG_HOST_MEM_REQ && el >= 16 && nreq < 8) {
++					for (int i = 0; i < 4; i++) {
++						req[nreq][i] = le32(v + a + 4 + 4 * i);
++					}
++					nreq++;
++				}
++				a += 4 + el;
++			}
++		}
++		o += 4 + len;
++	}
++	/* Host memory: ath10k sizing (peer-based requests: 33 peers + 1, vdev-based: 4 + 1). */
++	uint32_t chunk[8][3], used = D_HOSTMEM;
++	for (uint32_t i = 0; i < nreq; i++) {
++		uint32_t units = req[i][3], info = req[i][2];
++		if (info & 0x4u) {
++			units = 33 + 1;
++		} else if (info & 0x2u) {
++			units = 33 + 1;
++		} else if (info & 0x1u) {
++			units = 4 + 1;
++		}
++		uint32_t size = (units * req[i][1] + 4095) & ~4095u;
++		printf("NATRIUM WLAN: mem req %u: id %u unit %u info %#x units %u -> %u bytes at %#x\n", i, req[i][0],
++		    req[i][1], info, units, size, WL_DMA_PA + used);
++		if (used + size > WL_DMA_SIZE) {
++			printf("NATRIUM WLAN: host memory: out of DMA space\n");
++			return false;
++		}
++		chunk[i][0] = req[i][0];
++		chunk[i][1] = WL_DMA_PA + used;
++		chunk[i][2] = size;
++		used += size;
++	}
++
++	wl_step("wmi init");
++	uint32_t *w0 = (uint32_t *)wl_htc_tx_payload(&ce3), *w = w0;
++	*w++ = WMI_INIT_CMDID;
++	w = wl_tlv(w, TAG_INIT_CMD, 28);
++	for (int i = 0; i < 6; i++) {
++		*w++ = abi[i];                          /* the firmware's own ABI version */
++	}
++	*w++ = nreq;
++	w = wl_tlv(w, TAG_RESOURCE_CONFIG, 44 * 4);
++	{
++		/*
++		 * wmi_resource_config as ath10k_wmi_tlv_op_gen_init fills it for
++		 * QCA6174 hw3.2: 4 vdevs, 33 peers, 66 tids, skid 0x10, chains 7,
++		 * native-wifi decap, 1056 msdu descs, 22 wow filters, ...,
++		 * host_capab MGMT_BUNDLE_TX_COMPL.
++		 */
++		static const uint32_t cfg[44] = {
++			4, 0x21, 0, 0, 2, 0x42, 0x10, 7, 7, 0x64, 0x64,
++			0x64, 0x28, 1, 4, 4, 4, 8, 0, 0, 0, 0x400,
++			0x20, 0, 0, 0, 0, 2, 0x420, 2, 1, 0x20, 2,
++			5, 0x16, 6, 0, 1, 1, 0, 0, 0, 0, 0x200
++		};
++		for (int i = 0; i < 44; i++) {
++			*w++ = cfg[i];
++		}
++	}
++	w = wl_tlv(w, TAG_ARRAY_STRUC, nreq * 20);
++	for (uint32_t i = 0; i < nreq; i++) {
++		w = wl_tlv(w, TAG_HOST_MEM_CHUNK, 16);
++		*w++ = chunk[i][0];
++		*w++ = chunk[i][1];
++		*w++ = chunk[i][2];
++		*w++ = 0;
++	}
++	if (!wl_htc_send(&ce3, wl_wmi_ep, (uint32_t)((uint8_t *)w - (uint8_t *)w0))) {
++		return false;
++	}
++	if (!wl_wmi_wait(WMI_READY_EVTID, 5000)) {
++		printf("NATRIUM WLAN: no WMI ready (fw_ind %#x)\n", rd(wl_bar, Q_FW_IND));
++		return false;
++	}
++	const uint8_t *r = &wl_msg[4 + 4 + 24];        /* WMI hdr, TLV hdr, ABI: then mac addr */
++	printf("NATRIUM WLAN: WMI READY: MAC %02x:%02x:%02x:%02x:%02x:%02x status %u\n",
++	    r[0], r[1], r[2], r[3], r[4], r[5], le32(r + 8));
++	return true;
++}
++
+ static void
+ wl_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+@@ -1373,6 +1703,10 @@
+ 	if (ok) {
+ 		ok = wl_stage2();
+ 		printf("NATRIUM WLAN: stage 2 %s\n", ok ? "done: firmware up, HTC READY" : "FAILED");
++		if (ok) {
++			ok = wl_stage3();
++			printf("NATRIUM WLAN: stage 3 %s\n", ok ? "done: WMI ready" : "FAILED");
++		}
+ 		sweet_log_kick();
+ 	}
+ 	thread_terminate(current_thread());

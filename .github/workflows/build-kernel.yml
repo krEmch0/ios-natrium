@@ -1,0 +1,174 @@
+name: Build XNU Kernel for natrium
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-kernel:
+    runs-on: macos-13
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Xcode 15.4
+        run: |
+          sudo xcode-select -s /Applications/Xcode_15.4.app
+          xcodebuild -version
+
+      - name: Install KDK 13.5
+        run: |
+          # Download Kernel Debug Kit for macOS 13.5
+          curl -fsSL "https://download.developer.apple.com/Developer_Tools/Kernel_Debug_Kit_13.5_build_22G74/Kernel_Debug_Kit_13.5_build_22G74.dmg" \
+               -o /tmp/kdk.dmg || true
+          # Fallback: try alternate URL
+          # If KDK not available, build without it (development build)
+          echo "KDK installation attempted"
+
+      - name: Clone XNU dependencies
+        run: |
+          mkdir -p xnu/deps
+          cd xnu/deps
+          # dtrace
+          git clone --depth 1 https://github.com/apple-oss-distributions/dtrace.git
+          # AvailabilityVersions
+          git clone --depth 1 https://github.com/apple-oss-distributions/AvailabilityVersions.git
+          # libplatform
+          git clone --depth 1 https://github.com/apple-oss-distributions/libplatform.git
+          # libdispatch
+          git clone --depth 1 https://github.com/apple-oss-distributions/libdispatch.git
+
+      - name: Apply patches to XNU
+        run: |
+          cd xnu/src
+          echo "Applying ${$(ls ../patches/*.patch | wc -l)} patches..."
+          for patch in $(ls ../patches/*.patch | sort); do
+            echo "Applying $(basename $patch)"
+            patch -p1 < "$patch" || exit 1
+          done
+          echo "All patches applied"
+
+      - name: Build dtrace stubs
+        run: |
+          cd xnu/deps/dtrace
+          make install DSTROOT=/tmp/dst SRCROOT=$(pwd) OBJROOT=/tmp/obj SYMROOT=/tmp/sym
+        continue-on-error: true
+
+      - name: Build AvailabilityVersions
+        run: |
+          cd xnu/deps/AvailabilityVersions
+          make install DSTROOT=/tmp/dst SRCROOT=$(pwd) OBJROOT=/tmp/obj SYMROOT=/tmp/sym
+
+      - name: Build XNU kernel
+        run: |
+          cd xnu/src
+          export SDKROOT=$(xcrun --show-sdk-path)
+          make \
+            MACHINE_CONFIG=NATRIUM \
+            ARCH_CONFIGS=ARM64 \
+            KERNEL_CONFIGS=DEVELOPMENT \
+            DSTROOT=/tmp/xnu-dst \
+            OBJROOT=/tmp/xnu-obj \
+            SYMROOT=/tmp/xnu-sym \
+            SRCROOT=$(pwd) \
+            BUILD_WERROR=0 \
+            -j$(sysctl -n hw.ncpu)
+
+      - name: Copy kernel output
+        run: |
+          find /tmp/xnu-dst -name "kernel*" -type f | head -20
+          mkdir -p xnu/out
+          cp /tmp/xnu-dst/System/Library/Kernels/kernel.development xnu/out/kernel.development.natrium || \
+          find /tmp/xnu-dst -name "kernel*" -exec cp {} xnu/out/ \;
+          ls -lh xnu/out/
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-natrium
+          path: xnu/out/kernel.development.natrium
+          retention-days: 30
+
+  build-shim:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu make
+
+      - name: Build boot shim
+        run: |
+          cd shim
+          make -j$(nproc)
+
+      - name: Generate Apple Device Tree
+        run: |
+          python3 tools/mkadt.py dtb/natrium.adt --natrium --highmem
+          ls -lh dtb/
+
+      - name: Upload shim artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-natrium
+          path: |
+            shim/out/shim.bin
+            dtb/natrium.adt
+
+  assemble:
+    needs: [build-kernel, build-shim]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download kernel
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-natrium
+          path: xnu/out/
+
+      - name: Download shim + ADT
+        uses: actions/download-artifact@v4
+        with:
+          name: shim-natrium
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 android-sdk-libsparse-utils
+          pip3 install --break-system-packages pyelftools
+
+      - name: Assemble payload
+        run: |
+          python3 tools/mkpayload.py \
+            xnu/out/kernel.development.natrium \
+            dtb/natrium.adt \
+            xnu/out/payload.bin \
+            --cmdline "debug=0xc serial=3 cpus=4 keepsyms=1 rd=ufsroot0 ufsrw=1 rootrw=1 cs_enforcement_disable=1 amfi_get_out_of_my_way=1 wdt=-1 launchd_unsecure_cache=1 natriumfb_hz=60" \
+            --blob GPU-PM4=firmware/gpu/a530_pm4.fw \
+            --blob GPU-PFP=firmware/gpu/a530_pfp.fw \
+            --blob GPU-ZAP-MDT=firmware/gpu/a530_zap.mdt \
+            --blob GPU-ZAP-SEG=firmware/gpu/a530_zap.b02 \
+            --blob WLAN-FW=firmware/wifi/qwlan30.bin \
+            --blob WLAN-BDF=firmware/wifi/bdwlan30.bin
+
+      - name: Create boot image
+        run: |
+          ./tools/mkbootimg.sh
+          ls -lh natrium-boot.img
+
+      - name: Upload boot image
+        uses: actions/upload-artifact@v4
+        with:
+          name: natrium-boot-img
+          path: natrium-boot.img
+          retention-days: 7

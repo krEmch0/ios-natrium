@@ -1,0 +1,425 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -447,6 +447,39 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ /*
++ * Boot-arg sweetdeny=WORD[,WORD...]: exec of any file whose name contains
++ * one of the words fails with EACCES before the point of no return (a later
++ * failure SIGKILLs the spawner: launchd, 0182d), e.g. sweetdeny=coreduetd,Widget
++ * to see what background daemons cost without editing launchd.plist.
++ */
++static bool
++sweet_exec_denied(const char *name)
++{
++	static char list[256];
++	static int state;       /* 0 not parsed, 1 none, 2 set */
++	if (state == 0) {
++		state = PE_parse_boot_argn("sweetdeny", list, sizeof(list)) && list[0] ? 2 : 1;
++	}
++	for (const char *w = list; state == 2 && *w;) {
++		size_t n = 0;
++		while (w[n] && w[n] != ',') {
++			n++;
++		}
++		char word[64];
++		/* >= 4: a word cut short by the 608-byte boot-args limit ("a") matched launchd (0182e) */
++		if (n >= 4 && n < sizeof(word)) {
++			memcpy(word, w, n);
++			word[n] = '\0';
++			if (strnstr(name, word, strlen(name) + 1) != NULL) {
++				return true;
++			}
++		}
++		w += n + (w[n] == ',');
++	}
++	return false;
++}
++
++/*
+  * Boot-arg sweetenv=NAME:VAR=VAL[,VAR=VAL...] appends VAR=VAL to the
+  * environment of every executable whose file name is NAME, e.g.
+  * sweetenv=backboardd:CA_DISABLE_BACKDROP_CACHE=1 (CoreAnimation knobs
+@@ -2269,6 +2302,20 @@
+ 	}
+ 
+ 	error = exec_check_permissions(imgp);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (error == 0) {
++		const char *path = imgp->ip_strings + strlen("executable_path="), *base = path;
++		for (const char *c = path; *c; c++) {
++			if (*c == '/') {
++				base = c + 1;
++			}
++		}
++		if (sweet_exec_denied(base)) {
++			printf("exec %s denied (sweetdeny)\n", base);
++			error = EACCES;
++		}
++	}
++#endif
+ 	if (error) {
+ 		goto bad;
+ 	}
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -80,7 +80,8 @@
+ }
+ 
+ /*
+- * Profiler: boot-arg sweetprof=NAME (default backboardd, "-" = off).
++ * Profiler: boot-arg sweetprof=NAME (default backboardd, "-" = off);
++ * NAME,NAME,... profiles one name per 10 s round, in turn.
+  * osfmk/arm64/sleh.c records the user pc of NAME at every interrupt that
+  * lands on one of its threads; every 20 s this prints the sample counts
+  * ("PROF ... samples N kernel K of all A", A = interrupts on any non-idle
+@@ -122,13 +123,19 @@
+ 	static uint64_t top_pc[TOP];
+ 	static uint32_t top_n[TOP];
+ 
+-	if (!PE_parse_boot_argn("sweetprof", sweet_prof_name, sizeof(sweet_prof_name))) {
+-		strlcpy(sweet_prof_name, "backboardd", sizeof(sweet_prof_name));
++	static char list[128];
++	if (!PE_parse_boot_argn("sweetprof", list, sizeof(list))) {
++		strlcpy(list, "backboardd", sizeof(list));
+ 	}
+-	if (sweet_prof_name[0] == '-') {
++	if (list[0] == '-') {
+ 		return;
+ 	}
++	char *next = list;
+ 	for (int round = 0;; round++) {
++		char *end = strchr(next, ',');
++		size_t len = end ? (size_t)(end - next) : strlen(next);
++		strlcpy(sweet_prof_name, next, MIN(len + 1, sizeof(sweet_prof_name)));
++		next = end ? end + 1 : list;
+ 		sweet_prof_found = 0;
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_prof_find, NULL, NULL, NULL);
+ 		sweet_prof_pid = sweet_prof_found;
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,7 @@
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -70,7 +71,11 @@
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+-#define SWEET_FB_VSYNC_US               16667
++/*
++ * Vsync callback period (boot-arg sweetfb_vsync_hz, default 60). CA starts
++ * a frame per callback, so a 20 ms frame lands every second 16.7 ms tick.
++ */
++static uint32_t sweet_fb_vsync_us = 16667;
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -113,6 +118,7 @@
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void presenter(void *arg, wait_result_t wr);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -397,7 +403,16 @@
+ 	 * through, ~20 frames/s. Time from the copy's start, 3/4 period.
+ 	 */
+ 	nanoseconds_to_absolutetime(hz ? NSEC_PER_SEC / hz * 3 / 4 : 0, &fMinAbs);
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	uint32_t vhz = 60;
++	PE_parse_boot_argn("sweetfb_vsync_hz", &vhz, sizeof(vhz));
++	sweet_fb_vsync_us = 1000000 / MAX(vhz, 10u);
++	fVsync->setTimeoutUS(sweet_fb_vsync_us);
++	thread_t pt;
++	if (kernel_thread_start(&AppleCLCD::presenter, this, &pt) != KERN_SUCCESS) {
++		IOLog("SWEET FB: no presenter thread\n");
++		return false;
++	}
++	thread_deallocate(pt);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -672,13 +687,7 @@
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	IOLockUnlock(fb->fLock);
+-	/* The last frame of a burst, held back by the rate limit in swap(). */
+-	IOLockLock(fb->fPresentLock);
+-	if (fb->fDirty && !fb->fBlanked && now - fb->fLastPresent >= fb->fMinAbs) {
+-		fb->presentPending();
+-	}
+-	IOLockUnlock(fb->fPresentLock);
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sender->setTimeoutUS(sweet_fb_vsync_us);
+ }
+ 
+ void
+@@ -709,37 +718,69 @@
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
++/* gaps between swaps: < 20, < 37, < 54, longer ms (1, 2, 3, 4+ vsyncs; SWEET PERF) */
++extern "C" uint64_t sweet_fb_stat_gap[4];
++uint64_t sweet_fb_stat_gap[4];
++static uint64_t sweet_fb_last_swap;
+ static uint64_t sweet_fb_swap_count;
+ 
+ extern "C" void sweet_user_backtrace(const char *tag);
+ 
+-/* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+- * Copy the frame into the panel inside the swap call, at most sweetfb_hz
+- * (default 30) times a second; the vsync timer shows a frame held back by
+- * that limit once the swaps pause. backboardd draws the next frame into its
+- * other buffer as soon as this call returns, so a copy made later from the
+- * timer while it keeps swapping tore the image (seen on the power-off blur).
+- * fPresentLock also makes the next swap wait for a timer copy in progress.
++ * swap() only stores the record and wakes the presenter thread, which shows
++ * the newest frame at most sweetfb_hz (default 60) times a second (3/4 of a
++ * period apart, timed from the start of the previous present). backboardd
++ * no longer waits for the GPU scale + flip (~3.8 ms a frame, 0182a profile)
++ * in its render thread. It draws the next frame into its other surface; the
++ * one being presented is drawn into again only a frame later, by which time
++ * the ~2 ms GPU quad has read it.
+  */
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+-	IOLockLock(fPresentLock);
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	sweet_fb_stat_swaps++;
+-	IOLockUnlock(fLock);
+-	if (!fBlanked && mach_absolute_time() - fLastPresent >= fMinAbs) {
+-		presentPending();
++	uint64_t now = mach_absolute_time(), ns;
++	absolutetime_to_nanoseconds(now - sweet_fb_last_swap, &ns);
++	sweet_fb_last_swap = now;
++	if (ns < 200 * NSEC_PER_MSEC) {         /* longer: idle, not a frame gap */
++		sweet_fb_stat_gap[ns < 20 * NSEC_PER_MSEC ? 0 : ns < 37 * NSEC_PER_MSEC ? 1 : ns < 54 * NSEC_PER_MSEC ? 2 : 3]++;
+ 	}
+-	IOLockUnlock(fPresentLock);
++	IOLockWakeup(fLock, &fDirty, true);
++	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
+ 
++void
++AppleCLCD::presenter(void *arg, __unused wait_result_t wr)
++{
++	AppleCLCD *fb = (AppleCLCD *)arg;
++	IOLockLock(fb->fLock);
++	for (;;) {
++		/* blanked: setPower(true) presents what is pending */
++		if (!fb->fDirty || fb->fBlanked) {
++			IOLockSleep(fb->fLock, &fb->fDirty, THREAD_UNINT);
++			continue;
++		}
++		uint64_t due = fb->fLastPresent + fb->fMinAbs;
++		if (mach_absolute_time() < due) {
++			IOLockSleepDeadline(fb->fLock, &fb->fDirty, due, THREAD_UNINT);
++			continue;
++		}
++		IOLockUnlock(fb->fLock);
++		IOLockLock(fb->fPresentLock);
++		if (fb->fDirty && !fb->fBlanked) {
++			fb->presentPending();
++		}
++		IOLockUnlock(fb->fPresentLock);
++		IOLockLock(fb->fLock);
++	}
++}
++
+ /* fPresentLock held. */
+ void
+ AppleCLCD::presentPending(void)
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1511,16 +1511,27 @@
+ 	volatile uint32_t *fv = (volatile uint32_t *)(g_scratch_va + 64);
+ 	bool read = compute_run(g_gpu, &k_sample4, g_ksample4, bufs, sizes, (groups + 63) / 64, g_scratch + 64, seq, &x);
+ 	/*
+-	 * Spin on the fence: delay() sleeps on a timer, and with the CPUs busy
+-	 * drawing the wakeup came ms late (64x64 quads took 7 ms, 0140a).
++	 * Wait without the lock (user submits go on meanwhile): spin 0.5 ms
++	 * (delay() wakeups came ms late with the CPUs busy, 0140a), then poll
++	 * every 0.1 ms sleeping: a full-screen quad takes ~2 ms. The caller
++	 * keeps src and dst mapped.
+ 	 */
++	lck_mtx_unlock(&sweet_gpu_vm_lock);
+ 	bool done = false;
+-	uint64_t deadline;
++	uint64_t deadline, spin_until;
+ 	clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
+-	while (read && !(done = (*fv == seq)) && mach_absolute_time() < deadline) {
++	clock_interval_to_deadline(500, NSEC_PER_USEC, &spin_until);
++	while (read && !(done = (int32_t)(*fv - seq) >= 0) && mach_absolute_time() < deadline) {
++		if (mach_absolute_time() > spin_until) {
++			delay(100);
++		}
+ 		flush_dcache64((addr64_t)g_scratch + 64, 4, TRUE);
+ 	}
+-	vm_cache((uint32_t)df, drow, drows);
++	lck_mtx_lock(&sweet_gpu_vm_lock);
++	df = vm_range(q->dst_va, dlen);
++	if (df >= 0) {
++		vm_cache((uint32_t)df, drow, drows);
++	}
+ 	if (!done) {
+ 		g_ready = false;        /* hung: no recovery yet, fail fast from now on */
+ 		cp_state(g_gpu, "quad timeout:");
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -54,7 +54,30 @@
+ #define SWEET_GPU_CLIENT_BYTES  (768ull << 20)     /* own buffers per client */
+ 
+ extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
++extern "C" boolean_t pmap_is_modified(ppnum_t pn);
++extern "C" void pmap_clear_modify(ppnum_t pn);
++extern "C" boolean_t pmap_valid_page(ppnum_t pn);
+ 
++/*
++ * Push out the CPU's writes to page pa if any landed since the last call:
++ * the pmap's modified bit is set by the first user write after
++ * pmap_clear_modify (write-protect + fast fault). Cleared before the flush,
++ * so a write racing with it is caught next time. Kernel (physmap) writes do
++ * not set it: bos are flushed whole when created or imported.
++ * ponytail: also tells the VM the page is clean; fine while bos are wired.
++ */
++static void
++flush_if_written(uint64_t pa)
++{
++	ppnum_t pn = (ppnum_t)(pa >> PAGE_SHIFT);
++	if (!pmap_valid_page(pn)) {             /* not managed: no modified bit, always */
++		flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
++	} else if (pmap_is_modified(pn)) {
++		pmap_clear_modify(pn);
++		flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
++	}
++}
++
+ struct sweet_gpu_submit {
+ 	uint32_t nr_ibs, nr_bos;
+ };
+@@ -408,6 +431,13 @@
+ 		IOByteCount seg = 0;
+ 		pa[p] = md->getPhysicalSegment((IOByteCount)p * PAGE_SIZE, &seg, kIOMemoryMapperNone);
+ 		ok = pa[p] != 0 && (pa[p] & PAGE_MASK) == 0 && seg >= PAGE_SIZE;
++		if (ok) {
++			/* lines left by the zero-fill or earlier CPU use; submits flush only written pages */
++			if (pmap_valid_page((ppnum_t)(pa[p] >> PAGE_SHIFT))) {
++				pmap_clear_modify((ppnum_t)(pa[p] >> PAGE_SHIFT));
++			}
++			flush_dcache64((addr64_t)pa[p], PAGE_SIZE, TRUE);
++		}
+ 	}
+ 	uint64_t gva = ok ? sweet_gpu_vm_map(pa, npages, false) : 0;
+ 	if (gva == 0) {
+@@ -446,10 +476,13 @@
+ 		if (b == NULL) {
+ 			return kIOReturnBadArgument;
+ 		}
+-		/* CPU-cached: its CPU writes to memory, no stale lines over GPU writes */
+-		/* ponytail: whole bo every submit; track CPU-dirty bos if this shows in profiles */
++		/*
++		 * CPU-cached: its CPU writes to memory, no stale lines over GPU
++		 * writes. Only pages written since the last submit: flushing every
++		 * page of every listed bo was ~1/4 of backboardd's CPU (0182g).
++		 */
+ 		for (uint32_t p = 0; p < b->npages; p++) {
+-			flush_dcache64((addr64_t)b->pa[p], PAGE_SIZE, TRUE);
++			flush_if_written(b->pa[p]);
+ 		}
+ 	}
+ 	uint32_t seq = 0;
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -425,15 +425,33 @@
+ 	return true;
+ }
+ 
++uint32_t sweet_touch_moves;     /* finger positions sent to iOS (SWEET PERF) */
++
++/*
++ * Moves go to iOS at most sweettouchhz (default 60, 0 = every report) times
++ * a second, the newest position; downs and ups at once. The panel reports
++ * ~114 Hz while dragging, and each event costs backboardd's HID pipeline
++ * and SpringBoard more CPU than a frame shows (0182i).
++ */
++static uint64_t touch_move_gap, touch_move_last;
++static int touch_sent_x[TOUCH_MAX], touch_sent_y[TOUCH_MAX];
++
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
+ 	static unsigned logged;
++	uint64_t now = mach_absolute_time();
++	bool move_ok = now - touch_move_last >= touch_move_gap;
+ 	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
+ 		uint32_t bit = 1u << id;
+ 		if (mask & bit) {
+-			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
++			bool down = !(st.active & bit);
++			if (down || ((x[id] != touch_sent_x[id] || y[id] != touch_sent_y[id]) && move_ok)) {
+ 				sweet_hid_touch((int)id, 1, x[id], y[id]);
++				touch_sent_x[id] = x[id];
++				touch_sent_y[id] = y[id];
++				touch_move_last = now;
++				sweet_touch_moves++;
+ 				if (!(st.active & bit) && logged++ < 40) {
+ 					printf("SWEET TOUCH: down %u at %d,%d\n", id, x[id], y[id]);
+ 				}
+@@ -550,6 +568,11 @@
+ 	if (!qup_init() || !rmi_init()) {
+ 		goto out;
+ 	}
++	uint32_t hz = 60;
++	(void)PE_parse_boot_argn("sweettouchhz", &hz, sizeof(hz));
++	if (hz) {
++		nanoseconds_to_absolutetime(NSEC_PER_SEC / hz, &touch_move_gap);
++	}
+ 	int irq = 1;
+ 	(void)PE_parse_boot_argn("sweettouchirq", &irq, sizeof(irq));
+ 	if (irq) {
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -49,6 +49,8 @@
+ extern struct processor *thread_bind(struct processor *processor);
+ extern uint64_t sweet_fb_stat_swaps, sweet_fb_stat_presents, sweet_fb_stat_present_abs;
+ extern uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
++extern uint64_t sweet_fb_stat_gap[4];
++extern uint32_t sweet_touch_moves;
+ void sweet_perf_init(void);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -505,7 +507,8 @@
+ 	thread_bind(NULL);
+ 	top_gen = 1;
+ 	perf_top(0);
+-	uint64_t swaps = 0, presents = 0, pabs = 0, t = mach_absolute_time();
++	uint64_t swaps = 0, presents = 0, pabs = 0, t = mach_absolute_time(), gap[4] = {0};
++	uint32_t moves = 0;
+ 	for (;;) {
+ 		uint64_t mhz[4] = {0, 0, 0, 0};
+ 		for (int c = 0; c < 4 && c < (int)ml_get_cpu_count(); c++) {
+@@ -524,6 +527,11 @@
+ 		    dp ? perf_ns(dabs) / 1000 / dp : 0);
+ 		uint64_t bimc = clk_measure_mhz(0xad);
+ 		printf("SWEET PERF: bimc %llu MHz (DDR %llu MHz)\n", bimc, bimc * 2);
++		printf("SWEET PERF: swap gaps <20 %llu <37 %llu <54 %llu more %llu ms, touch moves %u\n",
++		    sweet_fb_stat_gap[0] - gap[0], sweet_fb_stat_gap[1] - gap[1], sweet_fb_stat_gap[2] - gap[2],
++		    sweet_fb_stat_gap[3] - gap[3], sweet_touch_moves - moves);
++		memcpy(gap, sweet_fb_stat_gap, sizeof(gap));
++		moves = sweet_touch_moves;
+ 		printf("SWEET PERF: panel kicks %llu (after done %llu, after 50 ms timeout %llu)\n",
+ 		    sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout);
+ 		perf_top(perf_ns(now - t));

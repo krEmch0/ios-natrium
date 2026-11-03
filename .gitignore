@@ -1,0 +1,15 @@
+# XNU source tree (too large, cloned separately in CI)
+xnu/src/
+# ios-sailfish reference (read-only reference)
+reference/
+# Build outputs
+xnu/out/
+shim/out/
+dtb/*.adt
+natrium-boot.img
+firmware_extract/
+# Temporary
+*.o
+*.d
+*.map
+*.dis

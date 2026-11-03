@@ -1,0 +1,317 @@
+--- a/bsd/dev/natrium_wlan.c
++++ b/bsd/dev/natrium_wlan.c
+@@ -2130,17 +2130,26 @@
+  */
+ #define WMI_VDEV_START_CMDID            0x5003u
+ #define WMI_VDEV_UP_CMDID               0x5005u
++#define WMI_VDEV_STOP_CMDID             0x5006u
++#define WMI_VDEV_DOWN_CMDID             0x5007u
+ #define WMI_VDEV_INSTALL_KEY_CMDID      0x5009u
+ #define WMI_PEER_CREATE_CMDID           0x6001u
++#define WMI_PEER_DELETE_CMDID           0x6002u
+ #define WMI_PEER_SET_PARAM_CMDID        0x6004u
+ #define WMI_PEER_ASSOC_CMDID            0x6005u
+ #define WMI_STA_PS_MODE_CMDID           0x9001u
+ #define WMI_VDEV_START_RESP_EVTID       0x5001u
++#define WMI_VDEV_STOPPED_EVTID          0x5002u
+ #define WMI_INSTALL_KEY_DONE_EVTID      0x5003u
++#define WMI_PEER_KICKOUT_EVTID          0x6001u
++#define WMI_ROAM_EVTID                  0xb001u /* {vdev, reason (2 beacon miss, 3 low rssi), rssi} */
+ #define TAG_VDEV_START                  0x58u
+ #define TAG_VDEV_UP                     0x5cu
++#define TAG_VDEV_STOP                   0x5du
++#define TAG_VDEV_DOWN                   0x5eu
+ #define TAG_INSTALL_KEY                 0x60u
+ #define TAG_PEER_CREATE                 0x61u
++#define TAG_PEER_DELETE                 0x62u
+ #define TAG_PEER_SET_PARAM              0x64u
+ #define TAG_PEER_ASSOC                  0x65u
+ #define TAG_VHT_RATE_SET                0x66u
+@@ -2490,6 +2499,23 @@
+ 	printf("NATRIUM WLAN: AP RSN: group cipher %u, pairwise CCMP %s, AKM PSK %s, caps %#x\n", r[7], ccmp ? "yes" : "NO",
+ 	    psk ? "yes" : "NO", caps);
+ 	return ccmp && psk && r[7] == 4 && !(caps & 0x40);     /* CCMP group; no required MFP */
++}
++
++/* The PTK (KCK, KEK, TK) and the AP's last replay counter, for group rekeys. */
++static uint8_t wl_ptk[48], wl_replay[8];
++
++/* GTK KDE in unwrapped key data kd (len bytes): key and id; false if absent. */
++static bool
++wl_gtk(const uint8_t *kd, uint32_t len, uint8_t gtk[16], uint8_t *id)
++{
++	for (uint32_t o = 0; o + 2 <= len && o + 2 + kd[o + 1] <= len; o += 2u + kd[o + 1]) {
++		if (kd[o] == 0xdd && kd[o + 1] == 6 + 16 && kd[o + 2] == 0 && kd[o + 3] == 0x0f && kd[o + 4] == 0xac && kd[o + 5] == 1) {
++			*id = kd[o + 6] & 3;
++			memcpy(gtk, kd + o + 8, 16);
++			return true;
++		}
++	}
++	return false;
+ }
+ 
+ /* The 4-way handshake: PTK from msg 1, msg 2 back, msg 3 checked, GTK unwrapped, msg 4, keys installed. */
+@@ -2497,7 +2523,7 @@
+ wl_4way(void)
+ {
+ 	static uint8_t e[512], r[EK_DATA + sizeof(wl_rsn)], kd[256];
+-	uint8_t pmk[32], ptk[48], snonce[32], anonce[32], gtk[16], gtk_id = 0, rsc[8];
++	uint8_t pmk[32], *ptk = wl_ptk, snonce[32], anonce[32], gtk[16], gtk_id = 0, rsc[8];
+ 	bool have_ptk = false, done = false;
+ 	wl_pmk(wl_psk, wl_ssid, pmk);
+ 	read_random(snonce, sizeof(snonce));
+@@ -2553,18 +2579,10 @@
+ 				printf("NATRIUM WLAN: EAPOL 3/4: MIC or ANonce mismatch (wrong passphrase?)\n");
+ 				continue;
+ 			}
+-			bool gtk_ok = false;
+-			if ((info & 0x1000u) && dlen <= sizeof(kd) + 8 && wl_unwrap(ptk + 16, e + EK_DATA, dlen, kd)) {
+-				for (uint32_t o = 0; o + 2 <= dlen - 8 && o + 2 + kd[o + 1] <= dlen - 8; o += 2u + kd[o + 1]) {
+-					if (kd[o] == 0xdd && kd[o + 1] == 6 + 16 && kd[o + 2] == 0 && kd[o + 3] == 0x0f && kd[o + 4] == 0xac &&
+-					    kd[o + 5] == 1) {
+-						gtk_id = kd[o + 6] & 3;
+-						memcpy(gtk, kd + o + 8, 16);
+-						gtk_ok = true;
+-					}
+-				}
+-			}
++			bool gtk_ok = (info & 0x1000u) && dlen >= 16 && dlen <= sizeof(kd) + 8 && wl_unwrap(ptk + 16, e + EK_DATA, dlen, kd) &&
++			    wl_gtk(kd, dlen - 8, gtk, &gtk_id);
+ 			memcpy(rsc, e + EK_RSC, 8);
++			memcpy(wl_replay, e + EK_REPLAY, 8);
+ 			uint32_t rl = EK_DATA;
+ 			bzero(r, rl);
+ 			r[0] = 1;
+@@ -2588,12 +2606,67 @@
+ 		}
+ 	}
+ 	bzero(pmk, sizeof(pmk));
+-	bzero(ptk, sizeof(ptk));
+ 	bzero(gtk, sizeof(gtk));
+ 	return done;
+ }
+ 
+ /*
++ * Group key handshake (the AP rotates the GTK, often hourly): msg 1 checked
++ * and replay-protected, new GTK installed, msg 2 back. False on a pairwise
++ * msg 1 (PTK rekey): the caller rejoins.
++ */
++static bool
++wl_rekey(void)
++{
++	static uint8_t e[512], r[EK_DATA], kd[256];
++	uint8_t mic[20], got[16], gtk[16], gtk_id = 0;
++	uint32_t n = wl_eapol_len;
++	memcpy(e, wl_eapol, n);
++	wl_eapol_len = 0;
++	uint32_t elen = 4u + (e[2] << 8 | e[3]), info = e[EK_INFO] << 8 | e[EK_INFO + 1];
++	uint32_t dlen = e[EK_DATA - 2] << 8 | e[EK_DATA - 1];
++	if (e[1] != 3 || elen > n || elen < EK_DATA || EK_DATA + dlen > elen) {
++		return true;
++	}
++	if (info & 0x8u) {
++		printf("NATRIUM WLAN: EAPOL pairwise key info %#x while connected (PTK rekey)\n", info);
++		return false;
++	}
++	if ((info & 0x13c0u) != 0x1380u) {              /* group msg 1: encrypted data, secure, MIC, ack */
++		printf("NATRIUM WLAN: EAPOL key info %#x ignored\n", info);
++		return true;
++	}
++	memcpy(got, e + EK_MIC, 16);
++	bzero(e + EK_MIC, 16);
++	wl_hmac_sha1(wl_ptk, 16, e, elen, NULL, 0, mic);
++	if (memcmp(mic, got, 16) != 0 || memcmp(e + EK_REPLAY, wl_replay, 8) <= 0) {
++		printf("NATRIUM WLAN: group rekey: MIC mismatch or replayed\n");
++		return true;
++	}
++	if (dlen < 16 || dlen > sizeof(kd) + 8 || !wl_unwrap(wl_ptk + 16, e + EK_DATA, dlen, kd) || !wl_gtk(kd, dlen - 8, gtk, &gtk_id)) {
++		printf("NATRIUM WLAN: group rekey: no GTK\n");
++		return true;
++	}
++	memcpy(wl_replay, e + EK_REPLAY, 8);
++	bzero(r, sizeof(r));
++	r[0] = 1;
++	r[1] = 3;
++	r[3] = EK_DATA - 4;
++	r[4] = 2;
++	r[EK_INFO] = 0x03;                              /* secure | MIC | group | v2 */
++	r[EK_INFO + 1] = 0x02;
++	memcpy(r + EK_REPLAY, e + EK_REPLAY, 8);
++	wl_hmac_sha1(wl_ptk, 16, r, sizeof(r), NULL, 0, mic);
++	memcpy(r + EK_MIC, mic, 16);
++	bool sent = wl_data_tx(wl_bss.bssid, 0x888e, r, sizeof(r));
++	bool ok = wl_install_key(gtk_id, 1, gtk, e + EK_RSC);
++	printf("NATRIUM WLAN: group rekey: GTK id %u %s, 2/2 %s\n", gtk_id, ok ? "installed" : "INSTALL FAILED",
++	    sent ? "sent" : "SEND FAILED");
++	bzero(gtk, sizeof(gtk));
++	return true;
++}
++
++/*
+  * Frames from the stack (NatriumWLAN::outputPacket): only queued here,
+  * the Wi-Fi thread converts and sends them (wl_run).
+  */
+@@ -2706,6 +2779,31 @@
+ 		printf("NATRIUM WLAN: tsens int en %#x/%#x, crit int %#x/%#x\n", rd(tm[0], 0x4), rd(tm[1], 0x4), rd(tm[0], 0x18), rd(tm[1], 0x18));
+ 	}
+ 	return max;
++}
++
++static bool wl_join(void);
++static void wl_leave(void);
++static uint32_t wl_drop_test;                   /* boot-arg natriumdrop: deauth ourselves after that many seconds (rejoin test) */
++
++/* Connection lost: link down for iOS, rejoin with backoff until it works (or the PCIe link is gone). */
++static void
++wl_rejoin(const char *why)
++{
++	printf("NATRIUM WLAN: connection lost (%s), rejoining\n", why);
++	wl_net_up = false;
++	natrium_wlan_iokit_link(false);
++	sweet_log_kick();
++	/* ponytail: same BSS and channel; an AP that moved channel needs a rescan here. */
++	for (uint32_t ms = 1000; wl_link("rejoin"); ms = ms < 16000 ? 2 * ms : 30000) {
++		wl_leave();
++		if (wl_join()) {
++			wl_net_up = true;
++			natrium_wlan_iokit_link(true);
++			break;
++		}
++		wl_msleep(ms);
++	}
++	sweet_log_kick();
+ }
+ 
+ /*
+@@ -2718,7 +2816,7 @@
+ {
+ 	static uint8_t fr[ETHER_MAX_LEN];
+ 	uint32_t events = 0, tx = 0, txdrop = 0, rx0 = wl_htt_rx;
+-	uint64_t next = wl_ms() + 10000;
++	uint64_t next = wl_ms() + 10000, drop = wl_drop_test ? wl_ms() + 1000ull * wl_drop_test : 0;
+ 	wl_aspm_off("data path");
+ 	for (;;) {
+ 		/* A BAR access over a dead link hangs the bus until the SoC resets: check first. */
+@@ -2757,12 +2855,39 @@
+ 			}
+ 			mbuf_freem(m);
+ 		}
++		if (drop && wl_ms() >= drop) {
++			static uint8_t f[32];
++			uint32_t dn = wl_hdr(f, 0xc0, 0, wl_bss.bssid);
++			f[dn] = 3;                              /* reason: leaving */
++			drop = 0;
++			printf("NATRIUM WLAN: rejoin test: deauth sent %s\n", wl_htt_tx(f, dn + 2, true) ? "ok" : "FAILED");
++		}
+ 		uint8_t eid = wl_htc_poll(0);
+-		if (eid == wl_wmi_ep && wl_msg_len >= 4 && wl_noisy(le32(wl_msg) & 0xffffffu) && events++ < 50) {
+-			/* roam 0xb001 {vdev, reason (2 beacon miss, 3 low rssi), rssi}, kickout 0x6001 {mac, reason} */
+-			printf("NATRIUM WLAN: WMI event %#x (%u bytes): %08x %08x %08x %08x\n", le32(wl_msg) & 0xffffffu, wl_msg_len,
+-			    wl_msg_len >= 12 ? le32(&wl_msg[8]) : 0, wl_msg_len >= 16 ? le32(&wl_msg[12]) : 0,
+-			    wl_msg_len >= 20 ? le32(&wl_msg[16]) : 0, wl_msg_len >= 24 ? le32(&wl_msg[20]) : 0);
++		const char *lost = NULL;
++		if (eid == wl_wmi_ep && wl_msg_len >= 4) {
++			uint32_t ev = le32(wl_msg) & 0xffffffu, flen = 0;
++			const uint8_t *fr = ev == WMI_MGMT_RX_EVTID ? wl_mgmt_frame(&flen) : NULL;
++			if (ev == WMI_PEER_KICKOUT_EVTID) {
++				lost = "kickout";
++			} else if (ev == WMI_ROAM_EVTID && wl_msg_len >= 16 && le32(&wl_msg[12]) == 2) {
++				lost = "beacon miss";
++			} else if (fr && flen >= 26 && (fr[0] == 0xc0 || fr[0] == 0xa0) && memcmp(fr + 10, wl_bss.bssid, 6) == 0 &&
++			    ((fr[4] & 1) || memcmp(fr + 4, wl_mac, 6) == 0)) {
++				printf("NATRIUM WLAN: %s from the AP, reason %u\n", fr[0] == 0xc0 ? "deauth" : "disassoc", fr[24] | fr[25] << 8);
++				lost = fr[0] == 0xc0 ? "deauth" : "disassoc";
++			}
++			if (wl_noisy(ev) && events++ < 50) {
++				printf("NATRIUM WLAN: WMI event %#x (%u bytes): %08x %08x %08x %08x\n", ev, wl_msg_len,
++				    wl_msg_len >= 12 ? le32(&wl_msg[8]) : 0, wl_msg_len >= 16 ? le32(&wl_msg[12]) : 0,
++				    wl_msg_len >= 20 ? le32(&wl_msg[16]) : 0, wl_msg_len >= 24 ? le32(&wl_msg[20]) : 0);
++			}
++		}
++		if (!lost && wl_eapol_len && !wl_rekey()) {
++			lost = "PTK rekey";
++		}
++		if (lost) {
++			wl_rejoin(lost);
++			continue;
+ 		}
+ 		if (!m && eid == 0xff) {
+ 			wl_msleep(1);
+@@ -2770,23 +2895,28 @@
+ 	}
+ }
+ 
+-static bool
+-wl_connect(void)
++/* Undo wl_join in the firmware (vdev down, peer delete, vdev stop) so that it can run again. */
++static void
++wl_leave(void)
+ {
+-	if (!wl_crypto_selftest()) {
+-		return false;
++	uint32_t v[3] = { 0, 0, 0 };
++	(void)wl_wmi_simple(WMI_VDEV_DOWN_CMDID, TAG_VDEV_DOWN, v, 1);
++	wl_put_mac(&v[1], wl_bss.bssid);
++	(void)wl_wmi_simple(WMI_PEER_DELETE_CMDID, TAG_PEER_DELETE, v, 3);
++	(void)wl_wmi_simple(WMI_VDEV_STOP_CMDID, TAG_VDEV_STOP, v, 1);
++	if (!wl_wmi_event(WMI_VDEV_STOPPED_EVTID, 1000)) {
++		printf("NATRIUM WLAN: vdev stop: no event\n");
+ 	}
+-	if (!wl_bss.found) {
+-		printf("NATRIUM WLAN: \"%s\" not found by the scan\n", wl_ssid);
+-		return false;
+-	}
++}
++
++/* Join wl_bss: vdev start, peer, auth, assoc, 4-way handshake, peer authorized. */
++static bool
++wl_join(void)
++{
+ 	uint32_t ch = wl_bss.ch, freq = ch <= 14 ? 2407 + 5 * ch : 5000 + 5 * ch, nr;
+ 	bool g = ch <= 14;
+ 	printf("NATRIUM WLAN: joining \"%s\": ch %u (%u MHz) snr %u cap %#x\n", wl_ssid, ch, freq, wl_bss.snr, wl_bss.cap);
+-	if (!wl_rsn_check()) {
+-		printf("NATRIUM WLAN: unsupported security (need WPA2-PSK with CCMP)\n");
+-		return false;
+-	}
++	wl_eapol_len = 0;
+ 	wl_step("connect");
+ 	uint32_t ps[2] = { 0, 0 };                      /* vdev 0: power save off */
+ 	if (!wl_wmi_simple(WMI_STA_PS_MODE_CMDID, TAG_STA_PS_MODE, ps, 2)) {
+@@ -2926,7 +3056,28 @@
+ 		return false;
+ 	}
+ 	printf("NATRIUM WLAN: CONNECTED to \"%s\" (WPA2-PSK, CCMP)\n", wl_ssid);
++	return true;
++}
++
++static bool
++wl_connect(void)
++{
++	if (!wl_crypto_selftest()) {
++		return false;
++	}
++	if (!wl_bss.found) {
++		printf("NATRIUM WLAN: \"%s\" not found by the scan\n", wl_ssid);
++		return false;
++	}
++	if (!wl_rsn_check()) {
++		printf("NATRIUM WLAN: unsupported security (need WPA2-PSK with CCMP)\n");
++		return false;
++	}
++	if (!wl_join()) {
++		return false;
++	}
+ 	sweet_log_kick();
++	wl_fast = true;                                 /* rejoins: no step pauses */
+ 	wl_net_up = true;
+ 	natrium_wlan_iokit_link(true);                 /* configd's IPConfiguration runs DHCP now */
+ 	sweet_log_kick();
+@@ -2973,6 +3124,7 @@
+ 	(void)PE_parse_boot_argn("natriumwlan", &on, sizeof(on));
+ 	(void)PE_parse_boot_argn("natriumssid", wl_ssid, sizeof(wl_ssid));
+ 	(void)PE_parse_boot_argn("natriumpsk", wl_psk, sizeof(wl_psk));
++	(void)PE_parse_boot_argn("natriumdrop", &wl_drop_test, sizeof(wl_drop_test));
+ 	if (!on) {
+ 		return;
+ 	}

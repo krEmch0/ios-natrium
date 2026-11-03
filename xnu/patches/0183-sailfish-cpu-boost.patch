@@ -1,0 +1,92 @@
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -188,8 +188,9 @@
+ 	return (clk_rd(saw, sts) & 0xffu) == vset;
+ }
+ 
+-static void
+-perf_turbo(vm_offset_t apc0, vm_offset_t apc1, vm_offset_t cbf, vm_offset_t cbfpll)
++/* S11 905 -> 940 mV and the mem-acc selects to their high-voltage value; false if not confirmed. */
++static bool
++perf_volt_up(void)
+ {
+ 	uint8_t vset = 0;
+ 	bool set = saw_set_vset(S11_VSET_NOM, S11_VSET_TURBO);
+@@ -202,8 +203,8 @@
+ 		(void)sweet_pmic_read(PMIC_S11, 0x41, &vset);
+ 	}
+ 	if (!set || vset != S11_VSET_TURBO) {
+-		printf("SWEET CLK: turbo skipped (S11 vset=%u)\n", vset);
+-		return;
++		printf("SWEET CLK: S11 not raised (vset=%u), clocks stay nominal\n", vset);
++		return false;
+ 	}
+ 	printf("SWEET CLK: S11 vset=%u (940 mV)\n", vset);
+ 	vm_offset_t macc = ml_io_map(MEMACC_PA, 0x1000);
+@@ -212,8 +213,13 @@
+ 		clk_wr(macc, 0xc0, a & ~0x1fu);
+ 		printf("SWEET CLK: mem-acc %#x -> %#x\n", a, clk_rd(macc, 0xc0));
+ 	}
+-	clk_pll_start(&clk_perf, apc1, apc1, CLK_MUX, 0, 2150);
+-	clk_pll_start(&clk_cbf, cbfpll, cbf, 0x18, 3, 1593);
++	return true;
++}
++
++/* CPU 0/1 from their PLL at mhz: lf mux to the GPLL0 aux clock while it is reprogrammed. */
++static void
++perf_pwr_start(vm_offset_t apc0, uint32_t mhz)
++{
+ 	uint32_t mux = clk_rd(apc0, CLK_MUX);
+ 	if ((mux & 0xfu) != 0x4u) {     /* ABL: hf 0 (lf mux), lf 1 (PLL main) */
+ 		printf("SWEET CLK: pwr mux=%#x unexpected, pwr cluster left alone\n", mux);
+@@ -221,8 +227,19 @@
+ 	}
+ 	clk_wr(apc0, CLK_MUX, (mux & ~0xcu) | (3u << 2));       /* lf: GPLL0 aux */
+ 	delay(5);
+-	clk_pll_start(&clk_pwr, apc0, apc0, CLK_MUX, 0, 1593);
++	clk_pll_start(&clk_pwr, apc0, apc0, CLK_MUX, 0, mhz);
+ 	clk_dump("pwrcl", apc0);
++}
++
++static void
++perf_turbo(vm_offset_t apc0, vm_offset_t apc1, vm_offset_t cbf, vm_offset_t cbfpll)
++{
++	if (!perf_volt_up()) {
++		return;
++	}
++	clk_pll_start(&clk_perf, apc1, apc1, CLK_MUX, 0, 2150);
++	clk_pll_start(&clk_cbf, cbfpll, cbf, 0x18, 3, 1593);
++	perf_pwr_start(apc0, 1593);
+ 	clk_dump("perfcl", apc1);
+ 	printf("SWEET CLK: cbf mux=%#x pll mode=%#x l=%u\n", clk_rd(cbf, 0x18), clk_rd(cbfpll, 0), clk_rd(cbfpll, 8));
+ }
+@@ -255,9 +272,28 @@
+ 	printf("SWEET CLK: S11 %s type=%#x subtype=%#x range=%#x vset=%#x (%u) mode=%#x en=%#x\n",
+ 	    ok ? "ok" : "READ FAILED", r[0], r[1], r[2], r[3], r[3], r[4], r[5]);
+ 	int on = 1, turbo = 0;
+-	uint32_t mhz = 1363, cbfmhz = 1190;
++	uint32_t mhz = 1363, cbfmhz = 1190, boost = 0, boostpwr = 0;
+ 	(void)PE_parse_boot_argn("sweetclk", &on, sizeof(on));
+ 	(void)PE_parse_boot_argn("sweetturbo", &turbo, sizeof(turbo));
++	/*
++	 * sweetboost=MHZ[ sweetboostpwr=MHZ]: S11 at 940 mV as for turbo, the
++	 * perf cluster at MHZ (<= 2150), the pwr cluster at sweetboostpwr
++	 * (<= 1593, 0 = stays 1228), CBF stays nominal (sweetcbf_mhz).
++	 */
++	(void)PE_parse_boot_argn("sweetboost", &boost, sizeof(boost));
++	(void)PE_parse_boot_argn("sweetboostpwr", &boostpwr, sizeof(boostpwr));
++	if (on && !turbo && boost && ok && r[1] == 0x09 && r[2] == 0 && r[3] == S11_VSET_NOM && perf_volt_up()) {
++		clk_pll_start(&clk_perf, apc1, apc1, CLK_MUX, 0, MIN(MAX(boost, 300u), 2150u));
++		clk_dump("perfcl", apc1);
++		if (boostpwr) {
++			perf_pwr_start(apc0, MIN(MAX(boostpwr, 300u), 1593u));
++		}
++		(void)PE_parse_boot_argn("sweetcbf_mhz", &cbfmhz, sizeof(cbfmhz));
++		if (cbfmhz >= 300) {
++			clk_pll_start(&clk_cbf, cbfpll, cbf, 0x18, 3, MIN(cbfmhz, 1593u));
++		}
++		return;
++	}
+ 	if (on && turbo && ok && r[1] == 0x09 && r[2] == 0 && r[3] == S11_VSET_NOM) {
+ 		perf_turbo(apc0, apc1, cbf, cbfpll);
+ 		if ((clk_rd(apc1, CLK_MUX) & 3u) == 1u) {
