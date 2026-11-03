@@ -89,9 +89,9 @@ jobs:
           mkdir -p "$SDKROOT/usr/local/lib" "$SDKROOT/usr/local/include"
           cp -r /tmp/xnu-dst/usr/local/lib/* "$SDKROOT/usr/local/lib/" 2>/dev/null || true
           cp -r /tmp/xnu-dst/usr/local/include/* "$SDKROOT/usr/local/include/" 2>/dev/null || true
-          # Copy object files to XNU source config directory
-          mkdir -p ../src/config
-          find /tmp/xnu-obj -name "*.o" -exec cp {} ../src/config/ \;
+          # Copy object files to XNU OBJROOT config directory
+          mkdir -p /tmp/xnu-obj/SETUP/config
+          find /tmp/xnu-obj -name "*.o" -exec cp {} /tmp/xnu-obj/SETUP/config/ \; 2>/dev/null || true
 
       - name: Build XNU kernel
         run: |
