@@ -118,9 +118,13 @@ jobs:
           done
           find /tmp/xnu-obj/SETUP -type f | head -20
           echo "=== Providing missing headers ==="
-          touch osfmk/mach/arm/asm.h
-          touch osfmk/mach/clock.defs
-          echo "=== Starting XNU build (skip DriverKit) ==="
+          mkdir -p osfmk/mach/arm
+          echo "/* stub */" > osfmk/mach/arm/asm.h
+          mkdir -p osfmk/mach
+          echo "/* stub */" > osfmk/mach/clock.defs
+          mkdir -p iokit/DriverKit
+          echo "/* stub */" > iokit/DriverKit/OSObject.iig.cpp
+          echo "=== Starting XNU build ==="
           make -e \
             MACHINE_CONFIG=SWEET \
             ARCH_CONFIGS=ARM64 \
@@ -132,6 +136,8 @@ jobs:
             SRCROOT=$(pwd) \
             BUILD_WERROR=0 \
             SKIP_DRIVERKIT=1 \
+            BUILD_DSYMS=0 \
+            BUILD_STATIC=0 \
             -j$(sysctl -n hw.ncpu)
 
       - name: Copy kernel output
