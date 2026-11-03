@@ -7,11 +7,9 @@ on:
 
 jobs:
   build-kernel:
-<<<<<<< Updated upstream
-    runs-on: macos-14
-=======
+
     runs-on: macos-15
->>>>>>> Stashed changes
+
     timeout-minutes: 120
 
     steps:
