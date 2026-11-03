@@ -27,14 +27,14 @@
 
 /* Memory map */
 #define DDR_BASE            0x80000000UL
-#define DDR_SIZE            0x100000000UL  /* 4 GB */
-#define KERNEL_LOAD_ADDR    0x100000000UL  /* Upper bank */
+#define DDR_SIZE            0x100000000ULL  /* 4 GB */
+#define KERNEL_LOAD_ADDR    0x100000000ULL  /* Upper bank */
 
 static void writel(uint32_t val, uintptr_t addr) {
     *(volatile uint32_t *)addr = val;
 }
 
-static uint32_t readl(uintptr_t addr) {
+static uint32_t __attribute__((unused)) readl(uintptr_t addr) {
     return *(volatile uint32_t *)addr;
 }
 
@@ -132,11 +132,13 @@ static void stop_secondary_cpus(void) {
     /* GICv3: ICC_SGI1R_EL1 */
     /* Target all except affinity 0.0.0.0 */
     __asm__ volatile(
-        "mov x0, #0x02000000\n"  /* Target list (CPU1) */
+        "movz x0, #0x0200, lsl #16\n"  /* Target list (CPU1): 0x02000000 */
         "msr ICC_SGI1R_EL1, x0\n"
-        "mov x0, #0x02000100\n"  /* Target list (CPU2) */
+        "movz x0, #0x0200, lsl #16\n"  /* Target list (CPU2): 0x02000100 */
+        "movk x0, #0x0100, lsl #0\n"
         "msr ICC_SGI1R_EL1, x0\n"
-        "mov x0, #0x02000101\n"  /* Target list (CPU3) */
+        "movz x0, #0x0200, lsl #16\n"  /* Target list (CPU3): 0x02000101 */
+        "movk x0, #0x0101, lsl #0\n"
         "msr ICC_SGI1R_EL1, x0\n"
         "isb\n"
         ::: "x0"
@@ -167,6 +169,7 @@ static void print_banner(void) {
  * Called from assembly entry point with ABL's DTB
  */
 void platform_early_init(void *abl_dtb) {
+    (void)abl_dtb;  /* reserved for future use */
     /* Initialize UART first for debugging */
     uart_early_init();
 
@@ -198,7 +201,9 @@ void platform_early_init(void *abl_dtb) {
  * platform_get_kernel_load_addr - Return kernel load address
  */
 uint64_t platform_get_kernel_load_addr(void) {
-    return KERNEL_LOAD_ADDR;
+    /* Use volatile to force memory read, avoiding assembler const issues */
+    static const volatile uint64_t addr = KERNEL_LOAD_ADDR;
+    return addr;
 }
 
 /**

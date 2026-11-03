@@ -18,9 +18,17 @@ class ADTProperty:
         if isinstance(value, str):
             self.value = value.encode('utf-8') + b'\0'
         elif isinstance(value, int):
-            self.value = struct.pack('>I', value)
+            # Handle 64-bit integers
+            if value > 0xFFFFFFFF:
+                self.value = struct.pack('>Q', value)
+            else:
+                self.value = struct.pack('>I', value)
         elif isinstance(value, list):
-            self.value = b''.join(struct.pack('>I', v) for v in value)
+            # Handle list of ints (check if any are 64-bit)
+            if any(v > 0xFFFFFFFF for v in value):
+                self.value = b''.join(struct.pack('>Q', v) for v in value)
+            else:
+                self.value = b''.join(struct.pack('>I', v) for v in value)
         else:
             self.value = value
 
