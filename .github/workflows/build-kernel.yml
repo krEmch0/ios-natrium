@@ -80,18 +80,15 @@ jobs:
       - name: Build AvailabilityVersions
         run: |
           cd xnu/deps/AvailabilityVersions
-          make install DSTROOT=/tmp/xnu-dst SRCROOT=$(pwd) OBJROOT=/tmp/xnu-obj SYMROOT=/tmp/xnu-sym
-          echo "=== AvailabilityVersions build output ==="
-          find /tmp/xnu-dst -type f
-          find /tmp/xnu-obj -type f | head -20
-          # Copy to SDKROOT
           SDKROOT=$(xcrun --show-sdk-path)
-          mkdir -p "$SDKROOT/usr/local/lib" "$SDKROOT/usr/local/include"
-          cp -r /tmp/xnu-dst/usr/local/lib/* "$SDKROOT/usr/local/lib/" 2>/dev/null || true
-          cp -r /tmp/xnu-dst/usr/local/include/* "$SDKROOT/usr/local/include/" 2>/dev/null || true
-          # Copy object files to XNU OBJROOT config directory
-          mkdir -p /tmp/xnu-obj/SETUP/config
-          find /tmp/xnu-obj -name "*.o" -exec cp {} /tmp/xnu-obj/SETUP/config/ \; 2>/dev/null || true
+          mkdir -p dst
+          make install SRCROOT=$(pwd) DSTROOT=$(pwd)/dst
+          echo "=== AvailabilityVersions output ==="
+          find dst -type f
+          sudo ditto dst/usr/local "$SDKROOT/usr/local"
+          echo "=== SDK usr/local after install ==="
+          ls -la "$SDKROOT/usr/local/lib/" || echo "No lib"
+          ls -la "$SDKROOT/usr/local/libexec/" || echo "No libexec"
 
       - name: Build XNU kernel
         run: |
