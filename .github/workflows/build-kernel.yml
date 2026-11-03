@@ -102,8 +102,8 @@ jobs:
           AVAIL_EOF
           printf '#!/bin/sh\nexec python3 /tmp/avail_stub.py "$@"\n' > "$SDKROOT/usr/local/libexec/availability.pl"
           chmod +x "$SDKROOT/usr/local/libexec/availability.pl"
-          sed -i '' '0,/^SUPPORTED_ARM64_MACHINE_CONFIGS.*BCM2837/{s/.*/SUPPORTED_ARM64_MACHINE_CONFIGS = SWEET/;}' makedefs/MakeInc.def
-          sed -i '' '0,/^override DEFAULT_ARM64_MACHINE_CONFIG.*:= VMAPPLE/{s/VMAPPLE/SWEET/;}' makedefs/MakeInc.top
+          sed -i '' 's/^SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE/SUPPORTED_ARM64_MACHINE_CONFIGS = SWEET/' makedefs/MakeInc.def
+          sed -i '' 's/^override DEFAULT_ARM64_MACHINE_CONFIG	:= VMAPPLE/override DEFAULT_ARM64_MACHINE_CONFIG	:= SWEET/' makedefs/MakeInc.top
           grep -E "SUPPORTED_ARM64_MACHINE_CONFIGS|DEFAULT_ARM64_MACHINE_CONFIG" makedefs/MakeInc.def makedefs/MakeInc.top
           make -e \
             MACHINE_CONFIG=SWEET \
