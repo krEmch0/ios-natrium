@@ -92,7 +92,7 @@ jobs:
           EOF
           chmod +x "$SDKROOT/usr/local/libexec/availability.pl"
           make \
-            MACHINE_CONFIG=NATRIUM \
+            MACHINE_CONFIG=SWEET \
             ARCH_CONFIGS=ARM64 \
             KERNEL_CONFIGS=DEVELOPMENT \
             DSTROOT=/tmp/xnu-dst \
