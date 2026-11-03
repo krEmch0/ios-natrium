@@ -32,7 +32,7 @@ jobs:
 
       - name: Clone XNU dependencies
         run: |
-          mkdir -p xnu/deps
+          mkdir -p xnu/deps xnu/src
           cd xnu/deps
           # dtrace
           git clone --depth 1 https://github.com/apple-oss-distributions/dtrace.git
@@ -42,6 +42,10 @@ jobs:
           git clone --depth 1 https://github.com/apple-oss-distributions/libplatform.git
           # libdispatch
           git clone --depth 1 https://github.com/apple-oss-distributions/libdispatch.git
+          # XNU source (iOS 16 generation)
+          cd ../src
+          git clone --depth 1 --branch xnu-8796.121.2 https://github.com/apple-oss-distributions/xnu.git .
+          echo "XNU source: xnu-8796.121.2 cloned"
 
       - name: Apply patches to XNU
         run: |
@@ -113,6 +117,7 @@ jobs:
 
       - name: Generate Apple Device Tree
         run: |
+          mkdir -p dtb
           python3 tools/mkadt.py dtb/natrium.adt --natrium --highmem
           ls -lh dtb/
 
