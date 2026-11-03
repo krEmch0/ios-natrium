@@ -50,7 +50,8 @@ jobs:
       - name: Apply patches to XNU
         run: |
           cd xnu/src
-          echo "Applying ${$(ls ../patches/*.patch | wc -l)} patches..."
+          PATCH_COUNT=$(ls ../patches/*.patch | wc -l)
+          echo "Applying $PATCH_COUNT patches..."
           for patch in $(ls ../patches/*.patch | sort); do
             echo "Applying $(basename $patch)"
             patch -p1 < "$patch" || exit 1
