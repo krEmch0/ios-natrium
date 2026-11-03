@@ -120,7 +120,7 @@ jobs:
           echo "=== Fixing missing/broken headers ==="
           # Fix 1: Create asm.h stub and move it from EXPORT_MD_GEN_LIST to EXPORT_MD_LIST
           printf '/* stub asm.h for open-source build */\n#ifndef _MACH_ARM_ASM_H_\n#define _MACH_ARM_ASM_H_\n#endif\n' > osfmk/mach/arm/asm.h
-          python3 << 'PYEOF'
+          cat > /tmp/fix_asm.py << 'PYEOF'
 with open('osfmk/mach/arm/Makefile') as f:
     t = f.read()
 t = t.replace('EXPORT_MD_LIST = ${DATAFILES}', 'EXPORT_MD_LIST = ${DATAFILES} asm.h')
@@ -132,6 +132,7 @@ with open('osfmk/mach/arm/Makefile', 'w') as f:
     f.write(t)
 print('arm/Makefile: asm.h moved from GEN to DATA list')
 PYEOF
+          python3 /tmp/fix_asm.py
           # Fix 2: Add VPATH to osfmk/mach/Makefile so MIG finds .defs source files
           printf 'VPATH = $(SOURCE)\n' | cat - osfmk/mach/Makefile > /tmp/mach_mf && mv /tmp/mach_mf osfmk/mach/Makefile
           echo "Added VPATH to osfmk/mach/Makefile"
