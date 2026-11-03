@@ -89,15 +89,16 @@ jobs:
           # Create stub availability.pl to work around missing Apple internal tool
           mkdir -p "$SDKROOT/usr/local/libexec"
           cat > "$SDKROOT/usr/local/libexec/availability.pl" << 'EOF'
-          #!/usr/bin/env perl
-          # Stub for availability.pl - generates empty symbol aliasing header
-          print "// Auto-generated stub by natrium build\n";
-          EOF
+#!/usr/bin/env perl
+# Stub for availability.pl - generates empty symbol aliasing header
+print "// Auto-generated stub by natrium build\n";
+EOF
           chmod +x "$SDKROOT/usr/local/libexec/availability.pl"
           make \
             MACHINE_CONFIG=SWEET \
             ARCH_CONFIGS=ARM64 \
             KERNEL_CONFIGS=DEVELOPMENT \
+            SUPPORTED_ARM64_MACHINE_CONFIGS=SWEET \
             DSTROOT=/tmp/xnu-dst \
             OBJROOT=/tmp/xnu-obj \
             SYMROOT=/tmp/xnu-sym \
