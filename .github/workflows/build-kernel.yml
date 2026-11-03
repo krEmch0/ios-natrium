@@ -110,6 +110,8 @@ jobs:
           grep -E "SUPPORTED_ARM64_MACHINE_CONFIGS|DEFAULT_ARM64_MACHINE_CONFIG" makedefs/MakeInc.def makedefs/MakeInc.top
           echo "=== Checking SETUP/config ==="
           ls -la SETUP/config/
+          echo "=== SETUP/config Makefile ==="
+          head -50 SETUP/config/Makefile
           echo "=== Starting XNU build ==="
           make -e \
             MACHINE_CONFIG=SWEET \
