@@ -112,9 +112,13 @@ jobs:
           ls -la SETUP/config/
           echo "=== Adding VPATH to SETUP/config Makefile ==="
           printf 'VPATH = $(SOURCE)\n' | cat - SETUP/config/Makefile > /tmp/setup_makefile && mv /tmp/setup_makefile SETUP/config/Makefile
-          head -5 SETUP/config/Makefile
-          echo "=== SETUP/config Makefile ==="
-          head -50 SETUP/config/Makefile
+          # Also pre-populate the OBJROOT build directory for SETUP/config
+          # XNU build runs make[5] in $OBJROOT/SETUP/config/ where source files must exist
+          mkdir -p /tmp/xnu-obj/SETUP/config
+          cp SETUP/config/*.c SETUP/config/*.h SETUP/config/*.y SETUP/config/*.l /tmp/xnu-obj/SETUP/config/ 2>/dev/null || true
+          echo "=== Pre-populated /tmp/xnu-obj/SETUP/config ==="
+          ls /tmp/xnu-obj/SETUP/config/
+          head -3 SETUP/config/Makefile
           echo "=== Starting XNU build ==="
           make -e \
             MACHINE_CONFIG=SWEET \
