@@ -111,7 +111,7 @@ jobs:
           echo "=== Checking SETUP/config ==="
           ls -la SETUP/config/
           echo "=== Adding VPATH to SETUP/config Makefile ==="
-          sed -i '' '1i VPATH = $(SOURCE)' SETUP/config/Makefile
+          printf 'VPATH = $(SOURCE)\n' | cat - SETUP/config/Makefile > /tmp/setup_makefile && mv /tmp/setup_makefile SETUP/config/Makefile
           head -5 SETUP/config/Makefile
           echo "=== SETUP/config Makefile ==="
           head -50 SETUP/config/Makefile
