@@ -80,14 +80,28 @@ jobs:
       - name: Build AvailabilityVersions
         run: |
           cd xnu/deps/AvailabilityVersions
-          make install DSTROOT=/tmp/dst SRCROOT=$(pwd) OBJROOT=/tmp/obj SYMROOT=/tmp/sym
+          make install DSTROOT=/tmp/xnu-dst SRCROOT=$(pwd) OBJROOT=/tmp/xnu-obj SYMROOT=/tmp/xnu-sym
+          # Also install to SDKROOT so XNU build can find it
+          SDKROOT=$(xcrun --show-sdk-path)
+          mkdir -p "$SDKROOT/usr/local/lib" "$SDKROOT/usr/local/include"
+          cp -r /tmp/xnu-dst/usr/local/lib/* "$SDKROOT/usr/local/lib/" 2>/dev/null || true
+          cp -r /tmp/xnu-dst/usr/local/include/* "$SDKROOT/usr/local/include/" 2>/dev/null || true
 
       - name: Build XNU kernel
         run: |
           cd xnu/src
           export SDKROOT=$(xcrun --show-sdk-path)
           mkdir -p "$SDKROOT/usr/local/libexec"
-          printf '#!/usr/bin/env perl\nprint "// Auto-generated stub\\n";\n' > "$SDKROOT/usr/local/libexec/availability.pl"
+          # availability.pl must print version lists when called with --ios or --macosx
+          cat > /tmp/availability_stub.pl << 'PEOF'
+#!/usr/bin/env perl
+if (grep { $_ eq '--ios' } @ARGV) {
+    print "8.0 9.0 10.0 11.0 12.0 13.0 14.0 15.0 16.0\n";
+} elsif (grep { $_ eq '--macosx' } @ARGV) {
+    print "10.9 10.10 10.11 10.12 10.13 10.14 10.15 11.0 12.0 13.0\n";
+}
+PEOF
+          cp /tmp/availability_stub.pl "$SDKROOT/usr/local/libexec/availability.pl"
           chmod +x "$SDKROOT/usr/local/libexec/availability.pl"
           sed -i '' '/^SUPPORTED_ARM64_MACHINE_CONFIGS.*BCM2837/s/.*/SUPPORTED_ARM64_MACHINE_CONFIGS = SWEET/' makedefs/MakeInc.def
           sed -i '' '/DEFAULT_ARM64_MACHINE_CONFIG/s/VMAPPLE/SWEET/' makedefs/MakeInc.top
