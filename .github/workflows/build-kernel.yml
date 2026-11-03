@@ -110,15 +110,14 @@ jobs:
           grep -E "SUPPORTED_ARM64_MACHINE_CONFIGS|DEFAULT_ARM64_MACHINE_CONFIG" makedefs/MakeInc.def makedefs/MakeInc.top
           echo "=== Checking SETUP/config ==="
           ls -la SETUP/config/
-          echo "=== Adding VPATH to SETUP/config Makefile ==="
-          printf 'VPATH = $(SOURCE)\n' | cat - SETUP/config/Makefile > /tmp/setup_makefile && mv /tmp/setup_makefile SETUP/config/Makefile
-          # Also pre-populate the OBJROOT build directory for SETUP/config
-          # XNU build runs make[5] in $OBJROOT/SETUP/config/ where source files must exist
-          mkdir -p /tmp/xnu-obj/SETUP/config
-          cp SETUP/config/*.c SETUP/config/*.h SETUP/config/*.y SETUP/config/*.l /tmp/xnu-obj/SETUP/config/ 2>/dev/null || true
-          echo "=== Pre-populated /tmp/xnu-obj/SETUP/config ==="
-          ls /tmp/xnu-obj/SETUP/config/
-          head -3 SETUP/config/Makefile
+          echo "=== Pre-populating all SETUP subdirs to OBJROOT ==="
+          # XNU build runs make[5] in $OBJROOT/SETUP/*/ where source files must exist
+          for d in SETUP/*/; do
+            mkdir -p /tmp/xnu-obj/"$d"
+            cp "$d"*.c "$d"*.h "$d"*.y "$d"*.l /tmp/xnu-obj/"$d" 2>/dev/null || true
+            echo "Pre-populated $d"
+          done
+          find /tmp/xnu-obj/SETUP -type f | head -20
           echo "=== Starting XNU build ==="
           make -e \
             MACHINE_CONFIG=SWEET \
