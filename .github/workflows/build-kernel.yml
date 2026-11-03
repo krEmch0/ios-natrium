@@ -81,11 +81,17 @@ jobs:
         run: |
           cd xnu/deps/AvailabilityVersions
           make install DSTROOT=/tmp/xnu-dst SRCROOT=$(pwd) OBJROOT=/tmp/xnu-obj SYMROOT=/tmp/xnu-sym
-          # Also install to SDKROOT so XNU build can find it
+          echo "=== AvailabilityVersions build output ==="
+          find /tmp/xnu-dst -type f
+          find /tmp/xnu-obj -type f | head -20
+          # Copy to SDKROOT
           SDKROOT=$(xcrun --show-sdk-path)
           mkdir -p "$SDKROOT/usr/local/lib" "$SDKROOT/usr/local/include"
           cp -r /tmp/xnu-dst/usr/local/lib/* "$SDKROOT/usr/local/lib/" 2>/dev/null || true
           cp -r /tmp/xnu-dst/usr/local/include/* "$SDKROOT/usr/local/include/" 2>/dev/null || true
+          # Copy object files to XNU source config directory
+          mkdir -p ../src/config
+          find /tmp/xnu-obj -name "*.o" -exec cp {} ../src/config/ \;
 
       - name: Build XNU kernel
         run: |
