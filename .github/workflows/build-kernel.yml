@@ -89,9 +89,9 @@ jobs:
           mkdir -p "$SDKROOT/usr/local/libexec"
           printf '#!/usr/bin/env perl\nprint "// Auto-generated stub\\n";\n' > "$SDKROOT/usr/local/libexec/availability.pl"
           chmod +x "$SDKROOT/usr/local/libexec/availability.pl"
-          sed -i '' 's/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837.*/SUPPORTED_ARM64_MACHINE_CONFIGS = SWEET/' makedefs/MakeInc.def
-          sed -i '' 's/override DEFAULT_ARM64_MACHINE_CONFIG := VMAPPLE/override DEFAULT_ARM64_MACHINE_CONFIG := SWEET/' makedefs/MakeInc.top
-          export SUPPORTED_ARM64_MACHINE_CONFIGS=SWEET
+          sed -i '' '/^SUPPORTED_ARM64_MACHINE_CONFIGS.*BCM2837/s/.*/SUPPORTED_ARM64_MACHINE_CONFIGS = SWEET/' makedefs/MakeInc.def
+          sed -i '' '/DEFAULT_ARM64_MACHINE_CONFIG/s/VMAPPLE/SWEET/' makedefs/MakeInc.top
+          grep -E "SUPPORTED_ARM64_MACHINE_CONFIGS|DEFAULT_ARM64_MACHINE_CONFIG" makedefs/MakeInc.def makedefs/MakeInc.top
           make -e \
             MACHINE_CONFIG=SWEET \
             ARCH_CONFIGS=ARM64 \
