@@ -118,18 +118,18 @@ jobs:
           done
           find /tmp/xnu-obj/SETUP -type f | head -20
           echo "=== Fixing missing/broken headers ==="
-          # Fix 1: Create asm.h stub in SRCROOT for arm and arm64
+          # Fix 1: Create asm.h stubs in SRCROOT (for VPATH) and in OBJROOT subdirs
+          #        where sub-make runs (current directory lookup)
           printf '/* stub asm.h for open-source build */\n#ifndef _MACH_ARM_ASM_H_\n#define _MACH_ARM_ASM_H_\n#endif\n' > osfmk/mach/arm/asm.h
           cp osfmk/mach/arm/asm.h osfmk/mach/arm64/asm.h
-          # Also pre-create in all OBJROOT export locations so GEN rule finds it
-          mkdir -p /tmp/xnu-obj/EXPORT_HDRS/osfmk/mach/arm
-          mkdir -p /tmp/xnu-obj/EXPORT_HDRS/osfmk/mach/arm64
-          cp osfmk/mach/arm/asm.h /tmp/xnu-obj/EXPORT_HDRS/osfmk/mach/arm/asm.h
-          cp osfmk/mach/arm/asm.h /tmp/xnu-obj/EXPORT_HDRS/osfmk/mach/arm64/asm.h
-          echo "Created asm.h stubs in arm and arm64"
-          # Fix 2: Add VPATH to osfmk/mach/Makefile so MIG finds .defs source files
-          printf 'VPATH = $(SOURCE)\n' | cat - osfmk/mach/Makefile > /tmp/mach_mf && mv /tmp/mach_mf osfmk/mach/Makefile
-          echo "Added VPATH to osfmk/mach/Makefile"
+          mkdir -p /tmp/xnu-obj/osfmk/mach/arm /tmp/xnu-obj/osfmk/mach/arm64
+          cp osfmk/mach/arm/asm.h /tmp/xnu-obj/osfmk/mach/arm/asm.h
+          cp osfmk/mach/arm/asm.h /tmp/xnu-obj/osfmk/mach/arm64/asm.h
+          echo "Created asm.h stubs in arm and arm64 (SRCROOT + OBJROOT)"
+          # Fix 2: Pre-copy all .defs files to OBJROOT/osfmk/mach/ so MIG finds them
+          mkdir -p /tmp/xnu-obj/osfmk/mach
+          cp osfmk/mach/*.defs /tmp/xnu-obj/osfmk/mach/ 2>/dev/null || true
+          echo "Pre-copied .defs files to OBJROOT/osfmk/mach/"
           # Fix 3: Remove DriverKit from iokit EXPINC/INSTINC subdirs (iig tool not in open-source)
           sed -i '' 's/EXPINC_SUBDIRS = IOKit DriverKit/EXPINC_SUBDIRS = IOKit/' iokit/Makefile
           sed -i '' 's/INSTINC_SUBDIRS = IOKit DriverKit System IOKitUser/INSTINC_SUBDIRS = IOKit System IOKitUser/' iokit/Makefile
