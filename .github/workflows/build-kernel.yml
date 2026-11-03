@@ -89,13 +89,13 @@ jobs:
           mkdir -p "$SDKROOT/usr/local/libexec"
           printf '#!/usr/bin/env perl\nprint "// Auto-generated stub\\n";\n' > "$SDKROOT/usr/local/libexec/availability.pl"
           chmod +x "$SDKROOT/usr/local/libexec/availability.pl"
-          # Restrict supported configs to SWEET only so VMAPPLE is never attempted
           sed -i '' 's/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837.*/SUPPORTED_ARM64_MACHINE_CONFIGS = SWEET/' makedefs/MakeInc.def
-          grep SUPPORTED_ARM64_MACHINE_CONFIGS makedefs/MakeInc.def
-          make \
+          export SUPPORTED_ARM64_MACHINE_CONFIGS=SWEET
+          make -e \
             MACHINE_CONFIG=SWEET \
             ARCH_CONFIGS=ARM64 \
             KERNEL_CONFIGS=DEVELOPMENT \
+            SUPPORTED_ARM64_MACHINE_CONFIGS=SWEET \
             DSTROOT=/tmp/xnu-dst \
             OBJROOT=/tmp/xnu-obj \
             SYMROOT=/tmp/xnu-sym \
