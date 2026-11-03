@@ -118,12 +118,27 @@ jobs:
           done
           find /tmp/xnu-obj/SETUP -type f | head -20
           echo "=== Providing missing headers ==="
+          # These files exist in XNU source but build looks for them via Makefile rules
+          # that run in OBJROOT — need to pre-copy them too
           mkdir -p osfmk/mach/arm
           echo "/* stub */" > osfmk/mach/arm/asm.h
           mkdir -p osfmk/mach
           echo "/* stub */" > osfmk/mach/clock.defs
-          mkdir -p iokit/DriverKit
-          echo "/* stub */" > iokit/DriverKit/OSObject.iig.cpp
+          # Pre-populate iokit/DriverKit for OSObject.iig.cpp and siblings
+          mkdir -p /tmp/xnu-obj/iokit/DriverKit
+          if [ -d iokit/DriverKit ]; then
+            cp iokit/DriverKit/*.iig.cpp iokit/DriverKit/*.h /tmp/xnu-obj/iokit/DriverKit/ 2>/dev/null || true
+            ls iokit/DriverKit/ | head -5
+          fi
+          # Also copy all .defs files to OBJROOT mirror so MIG rules find them
+          find osfmk/mach -name "*.defs" | while read f; do
+            d=$(dirname "$f")
+            mkdir -p /tmp/xnu-obj/EXPORT_HDRS/"$d"
+            cp "$f" /tmp/xnu-obj/EXPORT_HDRS/"$d"/ 2>/dev/null || true
+          done
+          # And arm asm.h
+          mkdir -p /tmp/xnu-obj/EXPORT_HDRS/osfmk/mach/arm
+          cp osfmk/mach/arm/asm.h /tmp/xnu-obj/EXPORT_HDRS/osfmk/mach/arm/ 2>/dev/null || true
           echo "=== Starting XNU build ==="
           make -e \
             MACHINE_CONFIG=SWEET \
