@@ -109,6 +109,13 @@ jobs:
           PYMK_EOF
           python3 /tmp/patch_driverkit_mk.py
           grep "^COMP_FILES\|GENERATED_IMPL" iokit/DriverKit/Makefile | head -5
+          # Add VPATH to the DriverKit Makefile so make can find the .iig source
+          # files when the %.h : %.iig static pattern rule runs in OBJROOT.
+          # Without VPATH, make sees "No rule to make target 'Foo.iig'" because
+          # the .iig files live in SOURCE (SRCROOT), not CURDIR (OBJROOT).
+          # The stub iig then copies SOURCE/Foo.iig -> OBJROOT/DriverKit/Foo.h.
+          printf '\nVPATH += $(SOURCE)\n' >> iokit/DriverKit/Makefile
+          echo "Added VPATH to iokit/DriverKit/Makefile"
           # Provide a stub iig tool: the real iig (Apple-internal) generates
           # .h and .iig.cpp from .iig sources.  For a kernel-only build we only
           # need the headers.  A .iig file is already valid C++ when __IIG is
