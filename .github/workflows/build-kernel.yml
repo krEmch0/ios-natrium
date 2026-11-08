@@ -136,8 +136,11 @@ jobs:
           echo "Pre-copied .defs files to OBJROOT/osfmk/mach/"
           # Add VPATH pointing to SOURCE in case the CURDIR approach doesn't work
           printf '\nVPATH += $(SOURCE)\n' >> osfmk/mach/Makefile
-          # Add explicit rules: each .defs file can be copied from SOURCE if not present
-          printf 'clock.defs: $(SOURCE)clock.defs\n\tcp $(SOURCE)clock.defs .\nclock_priv.defs: $(SOURCE)clock_priv.defs\n\tcp $(SOURCE)clock_priv.defs .\nclock_reply.defs: $(SOURCE)clock_reply.defs\n\tcp $(SOURCE)clock_reply.defs .\nclock_types.defs: $(SOURCE)clock_types.defs\n\tcp $(SOURCE)clock_types.defs .\n' >> osfmk/mach/Makefile
+          # Add explicit rules for ALL .defs files so MIG can find all transitive deps
+          for f in osfmk/mach/*.defs; do
+            base=$(basename "$f")
+            printf '%s: $(SOURCE)%s\n\tcp $< $@\n' "$base" "$base"
+          done >> osfmk/mach/Makefile
           echo "Added explicit .defs rules to osfmk/mach/Makefile"
           # Fix 3: Remove DriverKit from iokit EXPINC/INSTINC subdirs (iig tool not in open-source)
           sed -i '' 's/EXPINC_SUBDIRS = IOKit DriverKit/EXPINC_SUBDIRS = IOKit/' iokit/Makefile
