@@ -142,12 +142,21 @@ jobs:
             printf '%s: $(SOURCE)%s\n\tcp $< $@\n' "$base" "$base"
           done >> osfmk/mach/Makefile
           echo "Added explicit .defs rules to osfmk/mach/Makefile"
-          # Same fix for gssd (gssd_mach.defs) and kextd (kextd_mach.defs)
-          printf '\nVPATH += $(SOURCE)\ngssd_mach.defs: $(SOURCE)gssd_mach.defs\n\tcp $< $@\n' >> osfmk/gssd/Makefile
-          printf '\nVPATH += $(SOURCE)\nkextd_mach.defs: $(SOURCE)kextd_mach.defs\n\tcp $< $@\n' >> osfmk/kextd/Makefile
-          # libkern/libkern version.h.template
+          # Same fix for ALL other osfmk subdirs that contain .defs files
+          for dir in osfmk/gssd osfmk/kextd osfmk/lockd osfmk/device osfmk/mach_debug osfmk/UserNotification; do
+            if [ -d "$dir" ]; then
+              printf '\nVPATH += $(SOURCE)\n' >> "$dir/Makefile"
+              for f in "$dir"/*.defs; do
+                [ -f "$f" ] || continue
+                base=$(basename "$f")
+                printf '%s: $(SOURCE)%s\n\tcp $< $@\n' "$base" "$base"
+              done >> "$dir/Makefile"
+              echo "Added .defs rules to $dir/Makefile"
+            fi
+          done
+          # libkern/libkern version.h.template (same mechanism, different extension)
           printf '\nVPATH += $(SOURCE)\nversion.h.template: $(SOURCE)version.h.template\n\tcp $< $@\n' >> libkern/libkern/Makefile
-          echo "Added .defs/.template rules to gssd, kextd, libkern/libkern Makefiles"
+          echo "Added version.h.template rule to libkern/libkern/Makefile"
           # Fix 3: Remove DriverKit from iokit EXPINC/INSTINC subdirs (iig tool not in open-source)
           sed -i '' 's/EXPINC_SUBDIRS = IOKit DriverKit/EXPINC_SUBDIRS = IOKit/' iokit/Makefile
           sed -i '' 's/INSTINC_SUBDIRS = IOKit DriverKit System IOKitUser/INSTINC_SUBDIRS = IOKit System IOKitUser/' iokit/Makefile
