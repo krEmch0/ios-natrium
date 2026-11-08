@@ -162,6 +162,13 @@ jobs:
           sed -i '' 's/INSTINC_SUBDIRS = IOKit DriverKit System IOKitUser/INSTINC_SUBDIRS = IOKit System IOKitUser/' iokit/Makefile
           echo "Removed DriverKit from iokit export subdirs"
           echo "=== Starting XNU build ==="
+          # Xcode 16 clang added -Wpre-c11-compat and -Wcast-function-type-strict
+          # (both pulled in by -Weverything) which produce thousands of diagnostics
+          # in XNU 8796's BSD audit code and startup-hook macros.  Suppress them so
+          # the log stays readable and the diagnostics engine doesn't crash the job.
+          # Also limit parallelism to 4 so build output is not interleaved beyond
+          # recognition; real error lines are extracted at the end via grep.
+          set -o pipefail
           make -e \
             MACHINE_CONFIG=SWEET \
             ARCH_CONFIGS=ARM64 \
@@ -175,7 +182,12 @@ jobs:
             SKIP_DRIVERKIT=1 \
             BUILD_DSYMS=0 \
             BUILD_STATIC=0 \
-            -j$(sysctl -n hw.ncpu)
+            "CWARNFLAGS_STD+=-Wno-pre-c11-compat -Wno-cast-function-type-strict -Wno-error=pre-c11-compat -Wno-error=cast-function-type-strict" \
+            -j4 2>&1 | tee /tmp/xnu-build.log
+          BUILD_STATUS=${PIPESTATUS[0]}
+          echo "=== Build errors summary ==="
+          grep -E " error:" /tmp/xnu-build.log | grep -v "note:" | head -80 || true
+          exit $BUILD_STATUS
 
       - name: Copy kernel output
         run: |
