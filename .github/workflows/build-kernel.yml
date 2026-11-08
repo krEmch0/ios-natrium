@@ -42,6 +42,9 @@ jobs:
           git clone --depth 1 https://github.com/apple-oss-distributions/libplatform.git
           # libdispatch
           git clone --depth 1 https://github.com/apple-oss-distributions/libdispatch.git
+          # libpthread (SWEET builds the kext provider into the kernel; see
+          # patch 0019, which #includes "sweet_libpthread/kern/kern_init.c")
+          git clone --depth 1 --branch libpthread-514.100.2 https://github.com/apple-oss-distributions/libpthread.git
           # XNU source (iOS 16 generation)
           cd ../src
           git clone --depth 1 --branch xnu-8796.121.2 https://github.com/apple-oss-distributions/xnu.git .
@@ -67,6 +70,22 @@ jobs:
           done
           echo "$FAILED patches failed"
           [ $FAILED -lt 10 ] || exit 1  # Allow some failures
+          # Place libpthread where patch 0019 expects it:
+          #   SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
+          # The provider .c files #include "sweet_libpthread/kern/kern_init.c".
+          if [ -d ../deps/libpthread ]; then
+            mkdir -p bsd/pthread/sweet_libpthread
+            cp -a ../deps/libpthread/. bsd/pthread/sweet_libpthread/
+            echo "Placed libpthread at bsd/pthread/sweet_libpthread/"
+            ls bsd/pthread/sweet_libpthread/kern/kern_init.c
+          fi
+          # Remove DriverKit .iig.cpp entries from iokit/conf/files:
+          # the iig tool (Apple-internal) is not in open-source Xcode, so
+          # the .iig.cpp files are never generated and clang fails on them.
+          # The .iig source files stay; only the generated-impl references go.
+          sed -i '' '/^\.\/DriverKit\/.*\.iig\.cpp/d' iokit/conf/files
+          REMAINING=$(grep -c '^./DriverKit/.*\.iig\.cpp' iokit/conf/files || true)
+          echo "Removed DriverKit .iig.cpp entries from iokit/conf/files ($REMAINING remaining, expect 0)"
 
       - name: Build dtrace stubs
         run: |
@@ -157,10 +176,17 @@ jobs:
           # libkern/libkern version.h.template (same mechanism, different extension)
           printf '\nVPATH += $(SOURCE)\nversion.h.template: $(SOURCE)version.h.template\n\tcp $< $@\n' >> libkern/libkern/Makefile
           echo "Added version.h.template rule to libkern/libkern/Makefile"
-          # Fix 3: Remove DriverKit from iokit EXPINC/INSTINC subdirs (iig tool not in open-source)
+          # Fix 3: Remove DriverKit from iokit entirely (iig tool not in open-source Xcode)
+          #   a) iokit/Makefile: remove from EXPINC/INSTINC subdirs (header export)
+          #   b) iokit/conf/Makefile.template: remove from COMP_SUBDIRS (the
+          #      generated kernel Makefile recurses into DriverKit to run iig,
+          #      which fails because iig is Apple-internal)
           sed -i '' 's/EXPINC_SUBDIRS = IOKit DriverKit/EXPINC_SUBDIRS = IOKit/' iokit/Makefile
           sed -i '' 's/INSTINC_SUBDIRS = IOKit DriverKit System IOKitUser/INSTINC_SUBDIRS = IOKit System IOKitUser/' iokit/Makefile
-          echo "Removed DriverKit from iokit export subdirs"
+          sed -i '' '/^COMP_SUBDIRS = \\$/,/^[[:space:]]*DriverKit$/d' iokit/conf/Makefile.template
+          printf 'COMP_SUBDIRS =\n' >> iokit/conf/Makefile.template
+          echo "Removed DriverKit from iokit export subdirs and conf Makefile.template"
+          grep -n "COMP_SUBDIRS\|DriverKit" iokit/conf/Makefile.template | head -5
           echo "=== Starting XNU build ==="
           # Xcode 16 clang added -Wpre-c11-compat and -Wcast-function-type-strict
           # (both pulled in by -Weverything) which produce thousands of diagnostics
