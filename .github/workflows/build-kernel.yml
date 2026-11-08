@@ -90,22 +90,24 @@ jobs:
           # AND remove the $(GENERATED_IMPL) : $(GENERATED_HEADERS) dependency rule.
           # Removing COMP_FILES alone is not enough: the dependency rule means make
           # still tries to build .iig.cpp files (as targets of that rule) whenever
-          # the .h files are rebuilt, and falls through to its built-in .cpp rule
-          # which tries to compile "OSObject.iig.cpp → OSObject.iig" as a binary.
-          # Remove both: strip GENERATED_IMPL from COMP_FILES and delete the
-          # dependency rule.  The iig stub's --impl path writes to the .iig.cpp
-          # output file but make never needs to do anything with it.
-          python3 -c "
-import re, sys
-path = 'iokit/DriverKit/Makefile'
-txt = open(path).read()
-# Strip \$(GENERATED_IMPL) from COMP_FILES line
-txt = re.sub(r'(\bCOMP_FILES\s*=\s*\\\${GENERATED_HEADERS})\s*\\\$\(GENERATED_IMPL\)', r'\1', txt)
-# Remove the GENERATED_IMPL dependency rule (a bare target-only rule)
-txt = re.sub(r'\n\\\$\(GENERATED_IMPL\)\s*:\s*\\\$\(GENERATED_HEADERS\)\n', '\n', txt)
-open(path, 'w').write(txt)
-print('Patched iokit/DriverKit/Makefile')
-"
+          # the .h files are rebuilt, and falls back to its built-in .cpp suffix
+          # rule, trying to compile "OSObject.iig.cpp -> OSObject.iig" as a binary.
+          cat > /tmp/patch_driverkit_mk.py << 'PYMK_EOF'
+          import re
+          path = 'iokit/DriverKit/Makefile'
+          txt = open(path).read()
+          # Strip $(GENERATED_IMPL) from the COMP_FILES line
+          txt = re.sub(
+              r'(COMP_FILES\s*=\s*\$\{GENERATED_HEADERS\})\s*\$\(GENERATED_IMPL\)',
+              r'\1', txt)
+          # Remove the bare dependency rule: $(GENERATED_IMPL) : $(GENERATED_HEADERS)
+          txt = re.sub(
+              r'\n\$\(GENERATED_IMPL\)\s*:\s*\$\(GENERATED_HEADERS\)\n',
+              '\n', txt)
+          open(path, 'w').write(txt)
+          print('Patched iokit/DriverKit/Makefile')
+          PYMK_EOF
+          python3 /tmp/patch_driverkit_mk.py
           grep "^COMP_FILES\|GENERATED_IMPL" iokit/DriverKit/Makefile | head -5
           # Provide a stub iig tool: the real iig (Apple-internal) generates
           # .h and .iig.cpp from .iig sources.  For a kernel-only build we only
