@@ -128,16 +128,17 @@ jobs:
             sed -i '' '/^[[:space:]]*asm\.h$/d' "$mf"
           done
           echo "Removed asm.h from GEN lists in arm and arm64 Makefiles"
-          # Fix 2: Add VPATH to osfmk/mach/Makefile so MIG finds .defs in SRCROOT
-          #        clock.defs and other MIG inputs exist in SRCROOT but the MIG pattern
-          #        rule %.h : %.defs runs from OBJROOT. VPATH lets make find them.
-          #        Append at end of file (not after include line) to avoid breaking syntax.
-          printf '\nVPATH = $(SOURCE)\n' >> osfmk/mach/Makefile
-          echo "Added VPATH to osfmk/mach/Makefile"
-          # Also pre-copy .defs as a belt-and-suspenders approach
+          # Fix 2: Pre-copy .defs files to OBJROOT/osfmk/mach/ (the CURDIR for MIG sub-make)
+          #        Also add explicit rules in the Makefile as a fallback
           mkdir -p /tmp/xnu-obj/osfmk/mach
           cp osfmk/mach/*.defs /tmp/xnu-obj/osfmk/mach/
+          ls -la /tmp/xnu-obj/osfmk/mach/*.defs
           echo "Pre-copied .defs files to OBJROOT/osfmk/mach/"
+          # Add VPATH pointing to SOURCE in case the CURDIR approach doesn't work
+          printf '\nVPATH += $(SOURCE)\n' >> osfmk/mach/Makefile
+          # Add explicit rules: each .defs file can be copied from SOURCE if not present
+          printf 'clock.defs: $(SOURCE)clock.defs\n\tcp $(SOURCE)clock.defs .\nclock_priv.defs: $(SOURCE)clock_priv.defs\n\tcp $(SOURCE)clock_priv.defs .\nclock_reply.defs: $(SOURCE)clock_reply.defs\n\tcp $(SOURCE)clock_reply.defs .\nclock_types.defs: $(SOURCE)clock_types.defs\n\tcp $(SOURCE)clock_types.defs .\n' >> osfmk/mach/Makefile
+          echo "Added explicit .defs rules to osfmk/mach/Makefile"
           # Fix 3: Remove DriverKit from iokit EXPINC/INSTINC subdirs (iig tool not in open-source)
           sed -i '' 's/EXPINC_SUBDIRS = IOKit DriverKit/EXPINC_SUBDIRS = IOKit/' iokit/Makefile
           sed -i '' 's/INSTINC_SUBDIRS = IOKit DriverKit System IOKitUser/INSTINC_SUBDIRS = IOKit System IOKitUser/' iokit/Makefile
