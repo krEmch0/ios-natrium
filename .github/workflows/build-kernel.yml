@@ -86,6 +86,16 @@ jobs:
           sed -i '' '/^\.\/DriverKit\/.*\.iig\.cpp/d' iokit/conf/files
           REMAINING=$(grep -c '^./DriverKit/.*\.iig\.cpp' iokit/conf/files || true)
           echo "Removed DriverKit .iig.cpp entries from iokit/conf/files ($REMAINING remaining, expect 0)"
+          # Also strip $(GENERATED_IMPL) from COMP_FILES in iokit/DriverKit/Makefile.
+          # When make runs do_build_all to export the DriverKit headers, COMP_FILES
+          # includes both $(GENERATED_HEADERS) (the .h files we stub out) and
+          # $(GENERATED_IMPL) (the .iig.cpp files).  There is no explicit rule for
+          # the .iig.cpp files, so make falls back to its built-in .cpp rule and
+          # tries to compile "OSObject.iig.cpp → OSObject.iig" as a C++ binary.
+          # For a kernel-only build we only need the .h headers; drop the impl.
+          sed -i '' 's/^COMP_FILES = \${GENERATED_HEADERS} \$(GENERATED_IMPL)/COMP_FILES = ${GENERATED_HEADERS}/' iokit/DriverKit/Makefile
+          echo "Stripped GENERATED_IMPL from DriverKit COMP_FILES"
+          grep "^COMP_FILES" iokit/DriverKit/Makefile
           # Provide a stub iig tool: the real iig (Apple-internal) generates
           # .h and .iig.cpp from .iig sources.  For a kernel-only build we only
           # need the headers.  A .iig file is already valid C++ when __IIG is
