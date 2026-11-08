@@ -128,14 +128,12 @@ jobs:
             sed -i '' '/^[[:space:]]*asm\.h$/d' "$mf"
           done
           echo "Removed asm.h from GEN lists in arm and arm64 Makefiles"
-          # Fix 2: Add MIG .defs files to EXPORT_MI_LIST so they're available as prerequisites
-          #        clock.defs and others exist in SRCROOT but MIG pattern rules need them in OBJROOT
-          sed -i '' '/^EXPORT_MI_LIST.*= \$\(sort \\/a\
-          	${MIG_TYPES} \\
-          	${MIG_DEFS} \\
-          	${MIG_PRIVATE_DEFS} \\
-          	${MACH_PRIVATE_DEFS} \\' osfmk/mach/Makefile
-          echo "Added .defs files to EXPORT_MI_LIST in osfmk/mach/Makefile"
+          # Fix 2: Add VPATH to osfmk/mach/Makefile so MIG finds .defs in SRCROOT
+          #        clock.defs and other MIG inputs exist in SRCROOT but the MIG pattern
+          #        rule %.h : %.defs runs from OBJROOT. VPATH lets make find them.
+          sed -i '' '/^include $(MakeInc_rule)/a\
+          VPATH = $(SOURCE)' osfmk/mach/Makefile
+          echo "Added VPATH to osfmk/mach/Makefile"
           # Fix 3: Remove DriverKit from iokit EXPINC/INSTINC subdirs (iig tool not in open-source)
           sed -i '' 's/EXPINC_SUBDIRS = IOKit DriverKit/EXPINC_SUBDIRS = IOKit/' iokit/Makefile
           sed -i '' 's/INSTINC_SUBDIRS = IOKit DriverKit System IOKitUser/INSTINC_SUBDIRS = IOKit System IOKitUser/' iokit/Makefile
