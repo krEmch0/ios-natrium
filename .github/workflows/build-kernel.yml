@@ -86,6 +86,60 @@ jobs:
           sed -i '' '/^\.\/DriverKit\/.*\.iig\.cpp/d' iokit/conf/files
           REMAINING=$(grep -c '^./DriverKit/.*\.iig\.cpp' iokit/conf/files || true)
           echo "Removed DriverKit .iig.cpp entries from iokit/conf/files ($REMAINING remaining, expect 0)"
+          # Provide a stub iig tool: the real iig (Apple-internal) generates
+          # .h and .iig.cpp from .iig sources.  For a kernel-only build we only
+          # need the headers.  A .iig file is already valid C++ when __IIG is
+          # not defined: it has #if !__IIG guards that make the kernel view work,
+          # and the __IIG_ATTRIBUTES_DEFINED__ block falls through to empty
+          # macro definitions for non-iig compilation.  So a raw copy is a
+          # correct kernel-view header.  We also provide an empty .iig.cpp so
+          # the (now-removed from files, but still in Makefile rules) compile
+          # target finds a file if it ever runs.
+          cat > /tmp/iig-stub.sh << 'IIG_EOF'
+          #!/bin/bash
+          # Minimal iig replacement for kernel-only builds.
+          out_h=""; impl=""; defs=""
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              --def) defs="$2"; shift 2 ;;
+              --header) out_h="$2"; shift 2 ;;
+              --impl) impl="$2"; shift 2 ;;
+              --framework-name) shift 2 ;;
+              --) shift; break ;;
+              *) shift ;;
+            esac
+          done
+          [ -n "$out_h" -a -n "$defs" ] && cp "$defs" "$out_h"
+          [ -n "$impl" ] && echo "/* stub iig impl */" > "$impl"
+          IIG_EOF
+          chmod +x /tmp/iig-stub.sh
+          # Pre-generate all DriverKit .h files from .iig by copying (the .iig
+          # content is a valid kernel-view header thanks to its !__IIG guards).
+          for iig in iokit/DriverKit/*.iig; do
+            base=$(basename "$iig" .iig)
+            cp "$iig" "iokit/DriverKit/$base.h"
+          done
+          echo "Generated $(ls iokit/DriverKit/OSObject.h iokit/DriverKit/IOService.h 2>/dev/null | wc -l | tr -d ' ') sample DriverKit headers via iig stub (expect 2)"
+          head -3 iokit/DriverKit/OSObject.h
+          # Provide a stub TargetConditionals.h for the sweet_pthread provider.
+          # The libpthread kext code #undefs XNU_KERNEL_PRIVATE, which makes
+          # osfmk/kern/debug.h try to #include <TargetConditionals.h> (an SDK
+          # header not available under -nostdinc).  A minimal stub suffices
+          # because neither debug.h nor the libpthread code use its macros.
+          mkdir -p bsd/pthread/sweet_libpthread/include
+          cat > bsd/pthread/sweet_libpthread/include/TargetConditionals.h << 'TC_EOF'
+          #ifndef _TARGETCONDITIONALS_H
+          #define _TARGETCONDITIONALS_H
+          #define TARGET_OS_MAC          1
+          #define TARGET_OS_IPHONE       1
+          #define TARGET_OS_EMBEDDED     1
+          #define TARGET_OS_BRIDGE        0
+          #define TARGET_OS_WATCH         0
+          #define TARGET_OS_TV            0
+          #define TARGET_OS_SIMULATOR     0
+          #endif /* _TARGETCONDITIONALS_H */
+          TC_EOF
+          echo "Wrote stub TargetConditionals.h for sweet_libpthread"
 
       - name: Build dtrace stubs
         run: |
@@ -176,16 +230,17 @@ jobs:
           # libkern/libkern version.h.template (same mechanism, different extension)
           printf '\nVPATH += $(SOURCE)\nversion.h.template: $(SOURCE)version.h.template\n\tcp $< $@\n' >> libkern/libkern/Makefile
           echo "Added version.h.template rule to libkern/libkern/Makefile"
-          # Fix 3: Remove DriverKit from iokit entirely (iig tool not in open-source Xcode)
-          #   a) iokit/Makefile: remove from EXPINC/INSTINC subdirs (header export)
-          #   b) iokit/conf/Makefile.template: remove from COMP_SUBDIRS (the
-          #      generated kernel Makefile recurses into DriverKit to run iig,
-          #      which fails because iig is Apple-internal)
-          sed -i '' 's/EXPINC_SUBDIRS = IOKit DriverKit/EXPINC_SUBDIRS = IOKit/' iokit/Makefile
-          sed -i '' 's/INSTINC_SUBDIRS = IOKit DriverKit System IOKitUser/INSTINC_SUBDIRS = IOKit System IOKitUser/' iokit/Makefile
+          # Fix 3: Remove DriverKit from iokit compilation only (iig tool not in open-source Xcode)
+          #   a) iokit/conf/Makefile.template: blank COMP_SUBDIRS so the generated
+          #      kernel Makefile does not recurse into DriverKit to run iig
+          #   b) KEEP DriverKit in iokit/Makefile EXPINC/INSTINC subdirs so the
+          #      generated .h files get exported into EXPORT_HDRS for libkern etc.
+          #   c) Provide a stub iig and pass IIG=<stub> on the make line so the
+          #      DriverKit Makefile's %.h : %.iig rule doesn't fail on the
+          #      Apple-internal tool being missing.
           sed -i '' '/^COMP_SUBDIRS = \\$/,/^[[:space:]]*DriverKit$/d' iokit/conf/Makefile.template
           printf 'COMP_SUBDIRS =\n' >> iokit/conf/Makefile.template
-          echo "Removed DriverKit from iokit export subdirs and conf Makefile.template"
+          echo "Blanked COMP_SUBDIRS in iokit/conf/Makefile.template"
           grep -n "COMP_SUBDIRS\|DriverKit" iokit/conf/Makefile.template | head -5
           echo "=== Starting XNU build ==="
           # Xcode 16 clang added -Wpre-c11-compat and -Wcast-function-type-strict
@@ -208,6 +263,7 @@ jobs:
             SKIP_DRIVERKIT=1 \
             BUILD_DSYMS=0 \
             BUILD_STATIC=0 \
+            IIG=/tmp/iig-stub.sh \
             "CWARNFLAGS_STD+=-Wno-pre-c11-compat -Wno-cast-function-type-strict -Wno-error=pre-c11-compat -Wno-error=cast-function-type-strict" \
             -j4 2>&1 | tee /tmp/xnu-build.log
           BUILD_STATUS=${PIPESTATUS[0]}
