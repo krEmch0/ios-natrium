@@ -142,6 +142,12 @@ jobs:
             printf '%s: $(SOURCE)%s\n\tcp $< $@\n' "$base" "$base"
           done >> osfmk/mach/Makefile
           echo "Added explicit .defs rules to osfmk/mach/Makefile"
+          # Same fix for gssd (gssd_mach.defs) and kextd (kextd_mach.defs)
+          printf '\nVPATH += $(SOURCE)\ngssd_mach.defs: $(SOURCE)gssd_mach.defs\n\tcp $< $@\n' >> osfmk/gssd/Makefile
+          printf '\nVPATH += $(SOURCE)\nkextd_mach.defs: $(SOURCE)kextd_mach.defs\n\tcp $< $@\n' >> osfmk/kextd/Makefile
+          # libkern/libkern version.h.template
+          printf '\nVPATH += $(SOURCE)\nversion.h.template: $(SOURCE)version.h.template\n\tcp $< $@\n' >> libkern/libkern/Makefile
+          echo "Added .defs/.template rules to gssd, kextd, libkern/libkern Makefiles"
           # Fix 3: Remove DriverKit from iokit EXPINC/INSTINC subdirs (iig tool not in open-source)
           sed -i '' 's/EXPINC_SUBDIRS = IOKit DriverKit/EXPINC_SUBDIRS = IOKit/' iokit/Makefile
           sed -i '' 's/INSTINC_SUBDIRS = IOKit DriverKit System IOKitUser/INSTINC_SUBDIRS = IOKit System IOKitUser/' iokit/Makefile
