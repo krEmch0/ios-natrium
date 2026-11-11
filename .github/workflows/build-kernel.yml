@@ -116,6 +116,21 @@ jobs:
               r'(\$\(GENERATED_HEADERS\)\s*:\s*\\\s*\n\s*%.h\s*:\s*)%.iig',
               r'\1$(SOURCE)%.iig',
               txt, flags=re.DOTALL)
+          # Add explicit rules for OTHER_HEADERS so make knows they exist.
+          # These files are pre-copied to OBJROOT, so the rule just needs to
+          # tell make they're available (no actual copy command needed).
+          other_headers = [
+              'IOTypes.h', 'IOReturn.h', 'IORPC.h', 'IOKitKeys.h',
+              'IOKernelReportStructs.h', 'IOReportTypes.h',
+              'queue_implementation.h', 'macro_help.h',
+              'bounded_ptr.h', 'bounded_array.h', 'bounded_array_ref.h', 'bounded_ptr_fwd.h',
+              'OSBoundedArray.h', 'OSBoundedArrayRef.h', 'OSBoundedPtr.h', 'OSBoundedPtrFwd.h',
+              'safe_allocation.h'
+          ]
+          rules = '\n# Pre-copied OTHER_HEADERS (exist in OBJROOT)\n'
+          for h in other_headers:
+              rules += f'{h}:\n\t@:\n'
+          txt += rules
           open(path, 'w').write(txt)
           print('Patched iokit/DriverKit/Makefile')
           PYMK_EOF
