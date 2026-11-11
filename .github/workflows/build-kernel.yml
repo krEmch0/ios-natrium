@@ -105,19 +105,22 @@ jobs:
               r'\n\$\(GENERATED_IMPL\)\s*:\s*\$\(GENERATED_HEADERS\)\n',
               '\n', txt)
           # Fix the static pattern rule to look in $(SOURCE) for .iig files.
-          # Static pattern rules don't respect VPATH, so we must explicitly prefix
-          # the prerequisite pattern with $(SOURCE).
-          # Change: $(GENERATED_HEADERS) : %.h : %.iig
-          # To:     $(GENERATED_HEADERS) : %.h : $(SOURCE)%.iig
+          # The rule spans multiple lines with backslash continuation:
+          #   $(GENERATED_HEADERS) : \
+          #       %.h : %.iig
+          # Change to:
+          #   $(GENERATED_HEADERS) : \
+          #       %.h : $(SOURCE)%.iig
+          # Use DOTALL to match across newlines, and preserve whitespace.
           txt = re.sub(
-              r'(\$\(GENERATED_HEADERS\)\s*:\s*%.h\s*:\s*)%.iig',
+              r'(\$\(GENERATED_HEADERS\)\s*:\s*\\\s*\n\s*%.h\s*:\s*)%.iig',
               r'\1$(SOURCE)%.iig',
-              txt)
+              txt, flags=re.DOTALL)
           open(path, 'w').write(txt)
           print('Patched iokit/DriverKit/Makefile')
           PYMK_EOF
           python3 /tmp/patch_driverkit_mk.py
-          grep "^COMP_FILES\|GENERATED_IMPL\|GENERATED_HEADERS.*%.h" iokit/DriverKit/Makefile | head -5
+          grep -A1 "GENERATED_HEADERS.*:" iokit/DriverKit/Makefile | grep -E "COMP_FILES|%.h.*%.iig" | head -3
           # Provide a stub iig tool: the real iig (Apple-internal) generates
           # .h and .iig.cpp from .iig sources.  For a kernel-only build we only
           # need the headers.  A .iig file is already valid C++ when __IIG is
