@@ -154,15 +154,20 @@ jobs:
           # into OBJROOT/iokit/DriverKit/ so the sub-make (which runs with
           # OBJROOT as its CURDIR) can find everything without relying on VPATH.
           mkdir -p /tmp/xnu-obj/iokit/DriverKit
+          # FIRST: Copy all existing .h files (OTHER_HEADERS like IOTypes.h, IOReturn.h, etc.)
+          # that are NOT generated from .iig - do this BEFORE generating .h from .iig
+          for h in iokit/DriverKit/*.h; do
+            [ -f "$h" ] && cp "$h" "/tmp/xnu-obj/iokit/DriverKit/"
+          done
+          # THEN: Generate .h from .iig and copy both to OBJROOT
           for iig in iokit/DriverKit/*.iig; do
             base=$(basename "$iig" .iig)
             cp "$iig" "iokit/DriverKit/$base.h"
             cp "$iig" "/tmp/xnu-obj/iokit/DriverKit/$base.iig"
+            cp "iokit/DriverKit/$base.h" "/tmp/xnu-obj/iokit/DriverKit/"
           done
-          # Also copy all existing .h files (OTHER_HEADERS like IOTypes.h, IOReturn.h, etc.)
-          cp iokit/DriverKit/*.h /tmp/xnu-obj/iokit/DriverKit/ 2>/dev/null || true
-          echo "Generated $(ls iokit/DriverKit/OSObject.h iokit/DriverKit/IOService.h 2>/dev/null | wc -l | tr -d ' ') sample DriverKit headers from .iig + copied existing .h files to OBJROOT"
-          ls /tmp/xnu-obj/iokit/DriverKit/IOTypes.h /tmp/xnu-obj/iokit/DriverKit/IOReturn.h 2>/dev/null | wc -l | xargs echo "OTHER_HEADERS in OBJROOT:"
+          echo "Generated $(ls iokit/DriverKit/OSObject.h iokit/DriverKit/IOService.h 2>/dev/null | wc -l | tr -d ' ') sample DriverKit headers from .iig"
+          echo "OTHER_HEADERS in OBJROOT: $(ls /tmp/xnu-obj/iokit/DriverKit/IOTypes.h /tmp/xnu-obj/iokit/DriverKit/IOReturn.h 2>/dev/null | wc -l)"
           # Provide a stub TargetConditionals.h for the sweet_pthread provider.
           # The libpthread kext code #undefs XNU_KERNEL_PRIVATE, which makes
           # osfmk/kern/debug.h try to #include <TargetConditionals.h> (an SDK
