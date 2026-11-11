@@ -114,9 +114,9 @@ jobs:
           # VPATH must be set BEFORE the rules that depend on it; appending to
           # the end doesn't work because the rule is already parsed by then.
           # Insert after line 1 (after the export line) but before any rules.
-          sed -i '' '1a\
-VPATH += $(SOURCE)
-' iokit/DriverKit/Makefile
+          # Use a temp file to avoid YAML escaping issues with sed's multi-line syntax.
+          { head -1 iokit/DriverKit/Makefile; echo 'VPATH += $(SOURCE)'; tail -n +2 iokit/DriverKit/Makefile; } > /tmp/driverkit.mk.tmp
+          mv /tmp/driverkit.mk.tmp iokit/DriverKit/Makefile
           echo "Added VPATH to top of iokit/DriverKit/Makefile"
           head -5 iokit/DriverKit/Makefile
           # Provide a stub iig tool: the real iig (Apple-internal) generates
