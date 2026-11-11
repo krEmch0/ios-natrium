@@ -150,18 +150,19 @@ jobs:
           chmod +x /tmp/iig-stub.sh
           # Pre-generate all DriverKit .h files from .iig by copying (the .iig
           # content is a valid kernel-view header thanks to its !__IIG guards).
-          # Also pre-copy the .iig source files into OBJROOT/iokit/DriverKit/
-          # so the %.h : %.iig static pattern rule (which runs in OBJROOT) can
-          # find its prerequisite without needing VPATH (which doesn't work
-          # reliably with static pattern rules in sub-make contexts).
+          # Also pre-copy BOTH .iig source files AND existing .h header files
+          # into OBJROOT/iokit/DriverKit/ so the sub-make (which runs with
+          # OBJROOT as its CURDIR) can find everything without relying on VPATH.
           mkdir -p /tmp/xnu-obj/iokit/DriverKit
           for iig in iokit/DriverKit/*.iig; do
             base=$(basename "$iig" .iig)
             cp "$iig" "iokit/DriverKit/$base.h"
             cp "$iig" "/tmp/xnu-obj/iokit/DriverKit/$base.iig"
           done
-          echo "Generated $(ls iokit/DriverKit/OSObject.h iokit/DriverKit/IOService.h 2>/dev/null | wc -l | tr -d ' ') sample DriverKit headers + pre-copied .iig to OBJROOT (expect 2)"
-          head -3 iokit/DriverKit/OSObject.h
+          # Also copy all existing .h files (OTHER_HEADERS like IOTypes.h, IOReturn.h, etc.)
+          cp iokit/DriverKit/*.h /tmp/xnu-obj/iokit/DriverKit/ 2>/dev/null || true
+          echo "Generated $(ls iokit/DriverKit/OSObject.h iokit/DriverKit/IOService.h 2>/dev/null | wc -l | tr -d ' ') sample DriverKit headers from .iig + copied existing .h files to OBJROOT"
+          ls /tmp/xnu-obj/iokit/DriverKit/IOTypes.h /tmp/xnu-obj/iokit/DriverKit/IOReturn.h 2>/dev/null | wc -l | xargs echo "OTHER_HEADERS in OBJROOT:"
           # Provide a stub TargetConditionals.h for the sweet_pthread provider.
           # The libpthread kext code #undefs XNU_KERNEL_PRIVATE, which makes
           # osfmk/kern/debug.h try to #include <TargetConditionals.h> (an SDK
